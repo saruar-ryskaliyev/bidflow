@@ -1,0 +1,12 @@
+.gradle/
+build/
+buildSrc/build/
+buildSrc/.gradle/
+*.log
+*.hprof
+.DS_Store
+.idea/
+*.iml
+out/
+bench-results/
+.jqwik-database
