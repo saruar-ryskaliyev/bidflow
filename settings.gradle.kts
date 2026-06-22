@@ -8,3 +8,4 @@ dependencyResolutionManagement {
 }
 
 include("auction-core")
+include("sim")
