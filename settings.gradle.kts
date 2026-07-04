@@ -9,3 +9,4 @@ dependencyResolutionManagement {
 
 include("auction-core")
 include("sim")
+include("budget")
