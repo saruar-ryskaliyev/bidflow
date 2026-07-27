@@ -27,11 +27,11 @@ around. See [the hard problem](#the-hard-problem-distributed-budget-enforcement)
 | Pacing controller | Next |
 | Idempotent spend ledger | Not started |
 | gRPC serving layer | Not started |
-| JMH benchmarks and load harness | Not started |
+| `bench` — JMH microbenchmarks | Implemented; load harness not started |
 
-Performance claims are deliberately absent from this README until the JMH harness exists.
-The design is built for a sub-microsecond auction and zero steady-state allocation, but
-neither is a measurement yet.
+Performance is no longer a claim: the auction and the serving-path budget check are
+measured under JMH with allocation profiling in
+[Measured performance](#measured-performance).
 
 ## The hard problem: distributed budget enforcement
 
@@ -255,6 +255,28 @@ the same cost class as the selection itself.
 state, so each request-handling thread gets its own instance. Contended shared state is the
 wrong trade at this latency target.
 
+## Measured performance
+
+JMH 1.37 on an Apple M4 (macOS 15.6), OpenJDK 25, average time over two forks with the GC
+profiler attached. `./gradlew :bench:run --args="-prof gc"` reproduces the run.
+
+| Operation | Cost | Allocation |
+| --- | --- | --- |
+| Full auction — 64 candidates, 3 slots | 274.7 ± 12.2 ns | ≈ 0 B/op |
+| Full auction — 8 candidates, 3 slots | 40.2 ± 1.6 ns | ≈ 0 B/op |
+| `tryReserve` — the per-request budget check | 1.91 ± 0.15 ns | ≈ 0 B/op |
+
+The auction fits its microsecond budget more than three times over at the largest
+candidate set benchmarked, and the budget check is cheap enough that enforcement adds
+nothing measurable to a request. The allocation column is the earlier design claim made
+good: `gc.alloc.rate.norm` reports under a hundredth of a byte per operation — residue of
+JMH's own infrastructure — and no collection ran during measurement, so a warmed serving
+thread gives the collector no work to do.
+
+The honest caveats: these are single-threaded microbenchmark averages on one quiet
+machine, not a loaded service's p99. The load harness that would measure tail latency
+under sustained traffic, free of coordinated omission, is still on the roadmap.
+
 ## Testing
 
 Two layers, deliberately different in kind.
@@ -317,8 +339,9 @@ tests, where it can be reproduced by seed.
 
 ## Roadmap
 
-Done: the auction, the simulator, lease-based budget enforcement, unilateral reclaim, and the two
-experiments quantifying what reclaim costs and returns.
+Done: the auction, the simulator, lease-based budget enforcement, unilateral reclaim, the two
+experiments quantifying what reclaim costs and returns, and the JMH microbenchmarks that turned
+the latency and allocation design goals into measurements.
 
 1. **Close the rest of the delivery gap** — 60% is still not good enough, and the three suspected
    causes above are all measurable. Fixing the request stampede and the renewal gap should be
@@ -331,9 +354,7 @@ experiments quantifying what reclaim costs and returns.
    simulated day and letting the trade-off curve be explored rather than read.
 5. **Spend ledger** — write-ahead log with periodic snapshots and idempotency keys, so a retried
    click is charged exactly once.
-6. **JMH harness** — per-auction and per-`tryReserve` cost, and zero steady-state allocation
-   proven with `GcProfiler`.
-7. **gRPC serving** — deadline propagation and load shedding, because a late ad response is worth
+6. **gRPC serving** — deadline propagation and load shedding, because a late ad response is worth
    nothing and shedding beats queueing.
-8. **Load harness** — HDR histogram percentiles recorded free of coordinated omission, plus a
+7. **Load harness** — HDR histogram percentiles recorded free of coordinated omission, plus a
    ZGC-versus-G1 comparison under sustained load.
