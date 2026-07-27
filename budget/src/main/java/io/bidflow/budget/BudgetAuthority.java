@@ -1,164 +1,260 @@
 package io.bidflow.budget;
 
+import java.util.ArrayList;
+import java.util.List;
+
 /**
- * The bank: sole owner of a campaign's budget, handing out spend authority to serving shards
- * in advance so no shard has to ask permission per request.
+ * The bank: sole owner of a campaign's budget, leasing spend authority to serving shards in
+ * advance so no shard needs a network round trip per request.
  *
- * <h2>The one invariant</h2>
+ * <h2>The accounting</h2>
  *
- * <p>Everything rests on a single rule enforced in {@link #requestAuthority}:
+ * <p>Two numbers bound everything:
  *
- * <pre>{@code sum over shards of grantedMicros <= budgetMicros}</pre>
+ * <pre>{@code settledMicros + outstandingMicros <= budgetMicros}</pre>
  *
- * <p>A shard can only spend what it has been granted, and grants never total more than the
- * budget, so total spend cannot exceed the budget. Notice what that argument does not mention:
- * clocks, message ordering, retries, duplicates, or crashes. That is exactly why it is worth
- * having — it holds under every fault the simulator can inject, because none of those things
- * appear in it.
+ * <p>{@code settled} is spend accepted as final. {@code outstanding} is the full face value of
+ * every live lease, counted as though it will be spent in its entirety. A shard can never spend
+ * more than its lease, so actual spend can never exceed the sum, and the sum can never exceed
+ * the budget. New leases are issued only from what is left over.
  *
- * <p>The price of an argument that strong is paid in efficiency. Authority granted to a shard
- * that then crashes or goes idle is money nobody can spend, and this class never takes it
- * back, so it stays stranded and the campaign underdelivers. Reclaiming it is the obvious next
- * step and the dangerous one: a revocation racing a shard that is still spending is precisely
- * how overspend gets introduced, and the size of that race depends on clock skew. Building the
- * unconditionally safe version first means the cost of revocation can later be measured
- * against a known-good baseline rather than guessed at.
+ * <h2>Two ways money comes back, and only one of them is free</h2>
+ *
+ * <p><b>Voluntary release.</b> A shard seals a lease, meaning it has stopped spending, and
+ * reports the final figure when it asks for the next one. The authority settles that figure and
+ * returns the difference to the pool. This is exactly safe: the holder knew its own final number
+ * and had stopped. No clock appears in the argument.
+ *
+ * <p><b>Unilateral reclaim.</b> A shard that crashed or was partitioned away never releases
+ * anything, and that is where most stranded budget accumulates. Recovering it means waiting for
+ * the lease to expire and taking the remainder back. This is <em>not</em> free, and it fails in
+ * two distinct ways worth separating.
+ *
+ * <p>First, the holder may still be spending. It stops when its own clock passes the expiry,
+ * while the authority reclaims when its clock passes expiry plus {@code reclaimMargin}. If
+ * clocks disagree by at most {@code maxSkew}, a margin of at least {@code maxSkew} closes the
+ * overlap completely; a smaller margin leaves a window of {@code maxSkew - margin} in which both
+ * parties believe they own the money.
+ *
+ * <p>Second — and this one no margin can fix — the authority only knows what the shard
+ * <em>reported</em>. A partitioned shard's reports never arrived, so its last known figure may
+ * be far below what it actually spent, and settling the low figure frees money that is already
+ * gone. The exposure per lost lease is therefore the unreported portion, which is at worst the
+ * whole lease. That makes <b>lease size</b> the control for this risk rather than the margin:
+ * smaller leases cap the damage, at the price of more coordination traffic.
+ *
+ * <p>Setting {@link #NEVER_RECLAIM} as the margin disables unilateral reclaim entirely, which
+ * recovers the unconditionally safe behaviour and makes it one end of the trade-off curve rather
+ * than a separate implementation.
  *
  * <h2>Incarnations</h2>
  *
- * <p>A shard's wallet lives in memory and dies with its process. The replacement cannot know
- * what its predecessor spent, so handing it the shard's lifetime authority total would let it
- * respend everything already spent.
+ * <p>A wallet lives in memory and dies with its process, so a replacement cannot know what its
+ * predecessor spent. A request carrying a higher incarnation is taken as notice of a restart;
+ * requests from a superseded incarnation are refused. The dead process's lease is deliberately
+ * left outstanding so the expiry sweeper handles it — a crashed shard has certainly stopped
+ * spending, which makes it the safest possible case for reclaim.
  *
- * <p>So authority is scoped to an incarnation. A request carrying a higher incarnation than
- * the authority has seen is treated as an implicit announcement that the shard restarted: the
- * authority already granted is written off, and the new incarnation begins from zero. Requests
- * from an incarnation already superseded are refused outright. This keeps the invariant intact
- * across crashes at the cost of stranding whatever the dead process had not yet spent.
- *
- * <h2>Why reports are cumulative</h2>
- *
- * <p>Shards report their incarnation's spend so far, not deltas, and {@link #recordReport}
- * keeps the highest figure per shard. That makes reporting immune to the network with no
- * deduplication table: a duplicate is a no-op and a stale report cannot walk spend backwards.
- * An incremental report would need exactly-once delivery to stay correct, and networks do not
- * offer that.
- *
- * <p>Reports do not affect safety at all — they are how the authority learns what happened,
- * for pacing and for advertiser reporting. Safety comes from the grant side alone.
- *
- * <p><b>Not thread-safe.</b> This is a single logical owner; a real deployment would replicate
- * it for availability, and the durability of the granted totals is what would stop a crash
- * from re-granting money already spent.
+ * <p><b>Not thread-safe.</b> A single logical owner; a real deployment would replicate it, and
+ * the durability of its accounting is what would stop a crash from re-leasing spent money.
  */
 public final class BudgetAuthority {
 
-    /** Returned by {@link #requestAuthority} when the caller has already been superseded. */
-    public static final long SUPERSEDED = -1L;
+    /** A reclaim margin that never elapses, disabling unilateral reclaim. */
+    public static final long NEVER_RECLAIM = Long.MAX_VALUE;
 
     private final long budgetMicros;
-
-    /** Lifetime micros granted per shard, across all its incarnations. */
-    private final long[] grantedMicros;
-
-    /** Value of {@link #grantedMicros} when the current incarnation began. */
-    private final long[] incarnationBaseMicros;
+    private final long leaseDurationNanos;
+    private final long reclaimMarginNanos;
 
     private final long[] incarnations;
+    private final long[] nextLeaseIds;
 
-    /** Highest lifetime spend each shard has reported. */
-    private final long[] reportedSpentMicros;
+    private final List<Outstanding> outstanding = new ArrayList<>();
 
-    /** Value of {@link #reportedSpentMicros} when the current incarnation began. */
-    private final long[] reportedBaseMicros;
+    private long settledMicros;
+    private long outstandingMicros;
 
-    private long totalGrantedMicros;
-    private long grantsIssued;
-    private long grantsExhausted;
-    private long grantsSuperseded;
+    private long leasesIssued;
+    private long leasesExhausted;
+    private long leasesSuperseded;
+    private long leasesReleased;
+    private long leasesReclaimed;
+    private long releasedMicros;
+    private long reclaimedMicros;
     private long restartsObserved;
 
-    public BudgetAuthority(long budgetMicros, int shardCount) {
+    /**
+     * @param leaseDurationNanos how long each lease stays valid. Also the cap on what a single
+     *     unreachable shard can cost, since exposure per lost lease is bounded by its size.
+     * @param reclaimMarginNanos how long after expiry the authority waits before taking a lease
+     *     back, or {@link #NEVER_RECLAIM} to never do so. Must be at least the worst-case clock
+     *     disagreement for the holder to be guaranteed to have stopped.
+     */
+    public BudgetAuthority(
+            long budgetMicros, int shardCount, long leaseDurationNanos, long reclaimMarginNanos) {
         if (budgetMicros < 0) {
             throw new IllegalArgumentException("budgetMicros must not be negative, was " + budgetMicros);
         }
         if (shardCount <= 0) {
             throw new IllegalArgumentException("shardCount must be positive, was " + shardCount);
         }
+        if (leaseDurationNanos <= 0) {
+            throw new IllegalArgumentException(
+                    "leaseDurationNanos must be positive, was " + leaseDurationNanos);
+        }
+        if (reclaimMarginNanos < 0) {
+            throw new IllegalArgumentException(
+                    "reclaimMarginNanos must not be negative, was " + reclaimMarginNanos);
+        }
         this.budgetMicros = budgetMicros;
-        this.grantedMicros = new long[shardCount];
-        this.incarnationBaseMicros = new long[shardCount];
+        this.leaseDurationNanos = leaseDurationNanos;
+        this.reclaimMarginNanos = reclaimMarginNanos;
         this.incarnations = new long[shardCount];
-        this.reportedSpentMicros = new long[shardCount];
-        this.reportedBaseMicros = new long[shardCount];
+        this.nextLeaseIds = new long[shardCount];
     }
 
     /**
-     * Grants a shard incarnation as much of {@code wantedMicros} as the remaining budget
-     * allows.
+     * Settles a sealed lease if one is named, then issues a fresh lease from whatever budget is
+     * left.
      *
-     * @param incarnation the caller's incarnation; a higher value than last seen is taken as
-     *     notice that the shard restarted
-     * @return the incarnation's new total authority, or {@link #SUPERSEDED} if the caller has
-     *     been replaced by a later incarnation. The figure is cumulative rather than an
-     *     increment, which is what lets a duplicated reply be applied harmlessly.
+     * @param sealedLeaseId the lease the caller has stopped spending on, or {@link Lease#NONE}
+     * @param sealedSpentMicros that lease's final spend, meaningful only if it was sealed first
+     * @return the new lease, or null if the caller is superseded or the budget is exhausted
      */
-    public long requestAuthority(int shardId, long incarnation, long wantedMicros) {
+    public Lease requestLease(
+            int shardId,
+            long incarnation,
+            long sealedLeaseId,
+            long sealedSpentMicros,
+            long wantedMicros,
+            long nowNanos) {
         checkShard(shardId);
-        if (incarnation < 0) {
-            throw new IllegalArgumentException("incarnation must not be negative, was " + incarnation);
+        if (incarnation <= 0) {
+            throw new IllegalArgumentException("incarnation must be positive, was " + incarnation);
         }
         if (wantedMicros < 0) {
             throw new IllegalArgumentException("wantedMicros must not be negative, was " + wantedMicros);
         }
         if (incarnation < incarnations[shardId]) {
-            grantsSuperseded++;
-            return SUPERSEDED;
+            leasesSuperseded++;
+            return null;
         }
         if (incarnation > incarnations[shardId]) {
-            // The shard restarted. Whatever its predecessor held is written off: we cannot
-            // know how much of it was spent, so we must assume all of it was.
-            //
-            // A shard's first ever request also advances the incarnation, from the initial
-            // zero, but that is an introduction rather than a restart and must not be counted
-            // as one.
             if (incarnations[shardId] > 0) {
                 restartsObserved++;
             }
             incarnations[shardId] = incarnation;
-            incarnationBaseMicros[shardId] = grantedMicros[shardId];
-            reportedBaseMicros[shardId] = reportedSpentMicros[shardId];
+            // The predecessor's lease stays outstanding on purpose. It will be swept at expiry,
+            // and a dead process is the one case where reclaim is certain not to race a spender.
         }
-        final long headroom = budgetMicros - totalGrantedMicros;
-        final long granted = Math.min(wantedMicros, headroom);
-        if (granted > 0) {
-            grantedMicros[shardId] += granted;
-            totalGrantedMicros += granted;
-            grantsIssued++;
-        } else {
-            grantsExhausted++;
+        if (sealedLeaseId != Lease.NONE) {
+            release(shardId, incarnation, sealedLeaseId, sealedSpentMicros);
         }
-        return grantedMicros[shardId] - incarnationBaseMicros[shardId];
+
+        final long headroom = budgetMicros - settledMicros - outstandingMicros;
+        final long amount = Math.min(wantedMicros, headroom);
+        if (amount <= 0) {
+            leasesExhausted++;
+            return null;
+        }
+        final long leaseId = ++nextLeaseIds[shardId];
+        final Lease lease = new Lease(leaseId, amount, nowNanos + leaseDurationNanos);
+        outstanding.add(new Outstanding(shardId, incarnation, leaseId, amount, lease.expiresAtNanos()));
+        outstandingMicros += amount;
+        leasesIssued++;
+        return lease;
     }
 
     /**
-     * Records a shard's report of what its current incarnation has spent.
+     * Records how much of a live lease has been spent so far.
      *
-     * @param incarnationSpentMicros spend by that incarnation, not lifetime spend by the shard
+     * <p>Keeps the highest figure seen, so duplicated and reordered reports are both harmless
+     * without any deduplication table. These reports do not affect safety while the lease is
+     * live — the lease's full face value is already reserved — but they are what limits the
+     * damage if the lease later has to be reclaimed without its holder's cooperation.
      */
-    public void recordReport(int shardId, long incarnation, long incarnationSpentMicros) {
+    public void recordReport(int shardId, long incarnation, long leaseId, long spentSoFarMicros) {
         checkShard(shardId);
-        if (incarnationSpentMicros < 0) {
+        if (spentSoFarMicros < 0) {
             throw new IllegalArgumentException(
-                    "incarnationSpentMicros must not be negative, was " + incarnationSpentMicros);
+                    "spentSoFarMicros must not be negative, was " + spentSoFarMicros);
         }
-        if (incarnation != incarnations[shardId]) {
+        final Outstanding lease = find(shardId, incarnation, leaseId);
+        if (lease == null) {
             return;
         }
-        final long lifetime = reportedBaseMicros[shardId] + incarnationSpentMicros;
-        if (lifetime > reportedSpentMicros[shardId]) {
-            reportedSpentMicros[shardId] = lifetime;
+        final long capped = Math.min(spentSoFarMicros, lease.amountMicros);
+        if (capped > lease.reportedSpentMicros) {
+            lease.reportedSpentMicros = capped;
         }
+    }
+
+    /**
+     * Takes back every lease whose expiry has passed by the reclaim margin, settling each at its
+     * last reported spend.
+     *
+     * <p>Intended to be called on a timer. Anything freed here is money the authority is betting
+     * was never spent, and the bet is only as good as the reports it has.
+     *
+     * @return how many leases were reclaimed
+     */
+    public int reclaimExpired(long nowNanos) {
+        if (reclaimMarginNanos == NEVER_RECLAIM) {
+            return 0;
+        }
+        int reclaimed = 0;
+        int keep = 0;
+        for (int i = 0; i < outstanding.size(); i++) {
+            final Outstanding lease = outstanding.get(i);
+            // Written as a subtraction so that a distant expiry plus a large margin cannot
+            // overflow into the past.
+            final boolean due = nowNanos - lease.expiresAtNanos >= reclaimMarginNanos;
+            if (due) {
+                settledMicros += lease.reportedSpentMicros;
+                outstandingMicros -= lease.amountMicros;
+                reclaimedMicros += lease.amountMicros - lease.reportedSpentMicros;
+                leasesReclaimed++;
+                reclaimed++;
+            } else {
+                outstanding.set(keep++, lease);
+            }
+        }
+        while (outstanding.size() > keep) {
+            outstanding.remove(outstanding.size() - 1);
+        }
+        return reclaimed;
+    }
+
+    private void release(int shardId, long incarnation, long leaseId, long spentMicros) {
+        final int index = indexOf(shardId, incarnation, leaseId);
+        if (index < 0) {
+            // Already reclaimed by the sweeper, or a duplicated request. Either way there is
+            // nothing left to settle and re-settling would double-count.
+            return;
+        }
+        final Outstanding lease = outstanding.get(index);
+        final long finalSpend = Math.min(Math.max(spentMicros, lease.reportedSpentMicros), lease.amountMicros);
+        settledMicros += finalSpend;
+        outstandingMicros -= lease.amountMicros;
+        releasedMicros += lease.amountMicros - finalSpend;
+        leasesReleased++;
+        outstanding.remove(index);
+    }
+
+    private Outstanding find(int shardId, long incarnation, long leaseId) {
+        final int index = indexOf(shardId, incarnation, leaseId);
+        return index < 0 ? null : outstanding.get(index);
+    }
+
+    private int indexOf(int shardId, long incarnation, long leaseId) {
+        for (int i = 0; i < outstanding.size(); i++) {
+            final Outstanding lease = outstanding.get(i);
+            if (lease.shardId == shardId && lease.incarnation == incarnation && lease.leaseId == leaseId) {
+                return i;
+            }
+        }
+        return -1;
     }
 
     public long budgetMicros() {
@@ -166,70 +262,65 @@ public final class BudgetAuthority {
     }
 
     public int shardCount() {
-        return grantedMicros.length;
+        return incarnations.length;
     }
 
-    /** Total authority handed out. The invariant is that this never exceeds the budget. */
-    public long totalGrantedMicros() {
-        return totalGrantedMicros;
+    public long leaseDurationNanos() {
+        return leaseDurationNanos;
     }
 
-    /** Budget not yet promised to anyone. */
-    public long unallocatedMicros() {
-        return budgetMicros - totalGrantedMicros;
+    public long reclaimMarginNanos() {
+        return reclaimMarginNanos;
     }
 
-    public long grantedMicros(int shardId) {
-        checkShard(shardId);
-        return grantedMicros[shardId];
+    /** Spend accepted as final. */
+    public long settledMicros() {
+        return settledMicros;
     }
 
-    public long incarnation(int shardId) {
-        checkShard(shardId);
-        return incarnations[shardId];
+    /** Face value of all live leases, counted as if it will all be spent. */
+    public long outstandingMicros() {
+        return outstandingMicros;
     }
 
-    public long reportedSpentMicros(int shardId) {
-        checkShard(shardId);
-        return reportedSpentMicros[shardId];
+    /** Budget available to lease out. */
+    public long headroomMicros() {
+        return budgetMicros - settledMicros - outstandingMicros;
     }
 
-    public long totalReportedSpentMicros() {
-        long total = 0;
-        for (long reported : reportedSpentMicros) {
-            total += reported;
-        }
-        return total;
+    public int outstandingLeaseCount() {
+        return outstanding.size();
     }
 
-    /**
-     * Authority granted to incarnations that no longer exist, minus what they managed to
-     * report spending — an estimate of budget permanently lost to restarts.
-     *
-     * <p>An estimate rather than a fact, because a process that died mid-request may have spent
-     * money it never reported. That uncertainty is the whole reason the authority cannot safely
-     * reclaim this money.
-     */
-    public long strandedByRestartsMicros() {
-        long stranded = 0;
-        for (int shard = 0; shard < grantedMicros.length; shard++) {
-            stranded += incarnationBaseMicros[shard] - reportedBaseMicros[shard];
-        }
-        return stranded;
+    /** Returned to the pool by shards that sealed a lease and handed back the remainder. */
+    public long releasedMicros() {
+        return releasedMicros;
     }
 
-    public long grantsIssued() {
-        return grantsIssued;
+    /** Taken back on expiry without the holder's cooperation. The risky recovery. */
+    public long reclaimedMicros() {
+        return reclaimedMicros;
     }
 
-    /** Requests that arrived with the budget already fully allocated. */
-    public long grantsExhausted() {
-        return grantsExhausted;
+    public long leasesIssued() {
+        return leasesIssued;
     }
 
-    /** Requests refused because the caller had already been replaced. */
-    public long grantsSuperseded() {
-        return grantsSuperseded;
+    /** Requests that found the budget fully committed. */
+    public long leasesExhausted() {
+        return leasesExhausted;
+    }
+
+    public long leasesSuperseded() {
+        return leasesSuperseded;
+    }
+
+    public long leasesReleased() {
+        return leasesReleased;
+    }
+
+    public long leasesReclaimed() {
+        return leasesReclaimed;
     }
 
     public long restartsObserved() {
@@ -237,9 +328,28 @@ public final class BudgetAuthority {
     }
 
     private void checkShard(int shardId) {
-        if (shardId < 0 || shardId >= grantedMicros.length) {
+        if (shardId < 0 || shardId >= incarnations.length) {
             throw new IllegalArgumentException(
-                    "shardId must be in [0, " + grantedMicros.length + "), was " + shardId);
+                    "shardId must be in [0, " + incarnations.length + "), was " + shardId);
+        }
+    }
+
+    /** A live lease the authority is still waiting to hear about. */
+    private static final class Outstanding {
+        private final int shardId;
+        private final long incarnation;
+        private final long leaseId;
+        private final long amountMicros;
+        private final long expiresAtNanos;
+        private long reportedSpentMicros;
+
+        private Outstanding(
+                int shardId, long incarnation, long leaseId, long amountMicros, long expiresAtNanos) {
+            this.shardId = shardId;
+            this.incarnation = incarnation;
+            this.leaseId = leaseId;
+            this.amountMicros = amountMicros;
+            this.expiresAtNanos = expiresAtNanos;
         }
     }
 }

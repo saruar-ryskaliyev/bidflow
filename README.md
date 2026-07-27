@@ -22,9 +22,8 @@ around. See [the hard problem](#the-hard-problem-distributed-budget-enforcement)
 | --- | --- |
 | `auction-core` — GSP ranking and pricing | Implemented, 30 tests green |
 | `sim` — deterministic simulation harness | Implemented, 31 tests green |
-| `budget` — distributed budget enforcement | Safe baseline implemented, 31 tests green |
-| Reclaiming stranded budget | Next |
-| Pacing controller | Not started |
+| `budget` — distributed budget enforcement | Leases and reclaim implemented, 45 tests green |
+| Pacing controller | Next |
 | Idempotent spend ledger | Not started |
 | gRPC serving layer | Not started |
 | JMH benchmarks and load harness | Not started |
@@ -86,44 +85,88 @@ This is the approach FoundationDB and TigerBeetle take, and it is the piece that
 built first: determinism cannot be retrofitted onto code that has already been written
 against `System.nanoTime()` and real threads.
 
-## Results so far
+## Results
 
-A sweep of 200 randomised deployments — varying shard count, top-up size, network quality, and
-per-node clock skew, then injecting crashes and partitions on a schedule drawn from the seed:
+### The safety theorem
 
-| Measure | Result |
-| --- | --- |
-| Worst overspend across 200 seeds | **0 micros** |
-| Shard restarts exercised | 945 |
-| Messages discarded by partitions | 141,244 |
-| Messages dropped by the network | 29,452 |
-| Messages duplicated by the network | 12,813 |
-| Budget delivered, mean | 67.1% |
-| Budget delivered, worst seed | 6.0% |
+**Overspend can never exceed what the authority reclaimed unilaterally.**
 
-Two findings, and the second is the interesting one.
+Every micro of overspend comes from settling a lease below what was actually spent on it and
+re-leasing the difference, and that difference is exactly the reclaimed portion of that lease.
+Summing over all leases bounds total overspend by total reclaim. Two consequences define the ends
+of the trade-off: reclaim nothing and overspend is exactly zero, unconditionally; reclaim
+aggressively and the exposure is whatever was reclaimed.
 
-**Safety holds unconditionally.** Not "held under the faults we tried" — the argument does not
-mention clocks, ordering, retries, or crashes, so there is no fault of that kind for it to fail
-under. The sweep is evidence for the implementation matching the argument, not for the argument
-itself.
+The bound is asserted on every run of both experiments below, and across 120 randomised
+fault-injection seeds. It has never been violated.
 
-**Efficiency is poor, and now it is poor with a number attached.** Delivering 67% of budget on
-average is not good enough: an advertiser who asked to spend 100 and spent 67 is a lost
-customer. The worst seed delivered 6%, which is a shard cut off from the authority early and
-holding money nobody else could reach. Every micro of that gap is authority granted to a
-process that crashed or got partitioned away, and the current design never takes any of it
-back.
+### Experiment 1 — the clock-skew boundary
 
-That gap is the whole subject of the next phase. Closing it means letting the authority reclaim
-unspent grants, which means revocation, which means a revoke can race a shard that is still
-spending — and at that point overspend stops being structurally impossible and becomes a
-quantity bounded by clock skew. The honest way to make that trade is to have measured the safe
-baseline first, which is what these numbers are for.
+Every shard's clock runs 150 ms behind the authority. Healthy network, frequent reports, no
+faults, so shards always release their leases voluntarily and there is nothing legitimate left to
+reclaim. Twelve seeds per row.
 
-Two known inefficiencies already visible and not yet addressed: a shard whose reply is slow
-will ask again on its cooldown and can accumulate several grants it did not need, and a shard
-holding less than the cheapest request cannot spend its remainder.
+| Reclaim margin | Spent | Overspend | Reclaimed |
+| --- | --- | --- | --- |
+| 0 ms | 113.78% | 13.78% | 146.16% |
+| 50 ms | 113.78% | 13.78% | 122.06% |
+| 100 ms | 111.37% | 11.37% | 97.05% |
+| 150 ms | 100.00% | **0.00%** | 0.00% |
+| 300 ms | 100.00% | **0.00%** | 0.00% |
+
+An impatient authority takes leases back from shards that are still spending on them, and the
+overspend is severe — 13.8% of budget, and a reclaim total larger than the budget itself because
+the same money churns repeatedly. Once the margin covers the skew it collapses to exactly zero.
+
+The crossing is not quite at 150 ms, though. It sits somewhat below, because shards renew shortly
+*before* their lease expires, and sealing early shortens the window in which both parties believe
+they own the money. Proactive renewal buys safety margin for free — a small result, but one the
+experiment produced rather than one that was assumed.
+
+### Experiment 2 — the trade-off under crashes and partitions
+
+Randomised deployments with crashes, partitions, and ±50 ms skew, drawn from the seed. This is
+where reclaim earns its keep, because crashed and partitioned shards never release anything.
+Twelve seeds per row.
+
+| Configuration | Delivered | Overspend | Reclaimed |
+| --- | --- | --- | --- |
+| No expiry (the previous design) | 50.83% | **0.00%** | 0.00% |
+| Expiry, never reclaim | 46.71% | **0.00%** | 0.00% |
+| Expiry + reclaim, 500 ms margin | 54.85% | 0.081% | 95.97% |
+| Expiry + reclaim, 200 ms margin | 56.60% | 0.108% | 143.72% |
+| Expiry + reclaim, 100 ms margin | 57.68% | 0.108% | 172.62% |
+| Expiry + reclaim, 50 ms margin | 58.45% | 0.108% | 252.48% |
+| Expiry + reclaim, 0 ms margin | 60.16% | 0.807% | 427.32% |
+
+Three findings.
+
+**Expiry on its own is a regression.** 46.71% against 50.83% for never expiring at all. A lease
+that lapses unspent is wasted twice — the holder may no longer spend it and the authority still
+does not take it back. Expiry is not a feature, it is an enabler, and it only pays off paired with
+reclaim.
+
+**The pair is a real improvement, and the price is explicit.** Against the 50.83% baseline,
+a 500 ms margin buys four points of delivery for 0.08% overspend; a zero margin buys nine points
+for 0.8%. Which of those is correct is a business question about whether unbilled delivery costs
+more than undelivered budget, not an engineering one — and the point of the curve is that the
+question can now be answered with numbers instead of intuition.
+
+**Diminishing returns are sharp.** Delivery moves 5.3 points across the whole margin range while
+reclaim churn quadruples. Most of the recoverable money comes back with a patient margin; the
+aggressive settings buy little and risk an order of magnitude more.
+
+The comparison against "no expiry" is measured under the identical fault mix rather than quoted
+from an earlier run. An improvement demonstrated against a differently-configured baseline would
+not be an improvement.
+
+### Known inefficiencies, not yet addressed
+
+Delivery peaks around 60%, so most of the shortfall is still unexplained by reclaim alone. Three
+candidates are visible in the design and none has been fixed: a shard whose reply is slow will ask
+again on its cooldown and accumulate leases it did not need; sealing before renewal costs one
+round trip per lease during which the shard spends nothing; and a shard holding less than the
+cheapest request cannot spend its remainder.
 
 ## The mechanism
 
@@ -266,27 +309,23 @@ Requires JDK 25. The Gradle wrapper handles the rest.
 
 ## Roadmap
 
-Done: the budget authority, the shard-local wallet, and the fault-injection sweep establishing
-that the safe baseline never overspends.
+Done: the auction, the simulator, lease-based budget enforcement, unilateral reclaim, and the two
+experiments quantifying what reclaim costs and returns.
 
-1. **Reclaim stranded budget** — lease expiry with a safety margin sized to bounded clock skew,
-   so the authority can take back unspent grants. This is where overspend stops being
-   structurally impossible and becomes a bounded quantity, and where the 67% delivery figure
-   has to improve without the zero-overspend figure moving.
-2. **Quantify the trade** — sweep lease duration and skew tolerance, and produce the curve
-   relating recovered delivery to worst-case overspend. The curve is the actual deliverable;
-   any single configuration is just a point on it.
-3. **Suppress the request stampede** — a shard should not accumulate grants it did not need
-   because its first reply was slow.
-4. **Pacing controller** — spend the budget smoothly across a day of varying traffic rather
-   than exhausting it by mid-morning, built on the lease mechanism rather than beside it.
-5. **Wire in the auction** — replace the harness's synthetic per-request cost with a real
+1. **Close the rest of the delivery gap** — 60% is still not good enough, and the three suspected
+   causes above are all measurable. Fixing the request stampede and the renewal gap should be
+   worth more than any further tuning of the reclaim margin.
+2. **Pacing controller** — spend the budget smoothly across a day of varying traffic rather than
+   exhausting it by mid-morning, built on the lease mechanism rather than beside it.
+3. **Wire in the auction** — replace the harness's synthetic per-request cost with a real
    `auction-core` auction, so spend is driven by prices the auction actually cleared.
-6. **Spend ledger** — write-ahead log with periodic snapshots and idempotency keys, so a
-   retried click is charged exactly once.
-7. **JMH harness** — per-auction and per-`tryReserve` cost, and zero steady-state allocation
+4. **Simulation explorer** — a static site, generated by CI from a real run, replaying a
+   simulated day and letting the trade-off curve be explored rather than read.
+5. **Spend ledger** — write-ahead log with periodic snapshots and idempotency keys, so a retried
+   click is charged exactly once.
+6. **JMH harness** — per-auction and per-`tryReserve` cost, and zero steady-state allocation
    proven with `GcProfiler`.
-8. **gRPC serving** — deadline propagation and load shedding, because a late ad response is
-   worth nothing and shedding beats queueing.
-9. **Load harness** — HDR histogram percentiles recorded free of coordinated omission, plus
-   a ZGC-versus-G1 comparison under sustained load.
+7. **gRPC serving** — deadline propagation and load shedding, because a late ad response is worth
+   nothing and shedding beats queueing.
+8. **Load harness** — HDR histogram percentiles recorded free of coordinated omission, plus a
+   ZGC-versus-G1 comparison under sustained load.

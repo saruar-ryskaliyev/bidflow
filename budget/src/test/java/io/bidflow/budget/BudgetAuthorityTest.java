@@ -4,163 +4,293 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 
 class BudgetAuthorityTest {
 
-    @Test
-    @DisplayName("grants what is asked for while budget remains")
-    void grantsWhileBudgetRemains() {
-        final BudgetAuthority bank = new BudgetAuthority(1_000L, 2);
+    private static final long LEASE_DURATION = 1_000L;
+    private static final long MARGIN = 100L;
+    private static final long T0 = 10_000L;
 
-        assertThat(bank.requestAuthority(0, 1L, 300L)).isEqualTo(300L);
-        assertThat(bank.requestAuthority(0, 1L, 200L)).isEqualTo(500L);
-        assertThat(bank.totalGrantedMicros()).isEqualTo(500L);
-        assertThat(bank.unallocatedMicros()).isEqualTo(500L);
+    private static BudgetAuthority bank(long budget, int shards) {
+        return new BudgetAuthority(budget, shards, LEASE_DURATION, MARGIN);
     }
 
-    @Test
-    @DisplayName("returns a running total, not the increment")
-    void returnsCumulativeAuthority() {
-        final BudgetAuthority bank = new BudgetAuthority(1_000L, 1);
-
-        assertThat(bank.requestAuthority(0, 1L, 100L)).isEqualTo(100L);
-        assertThat(bank.requestAuthority(0, 1L, 100L)).isEqualTo(200L);
-        assertThat(bank.requestAuthority(0, 1L, 100L)).isEqualTo(300L);
+    /** Convenience for the common case of a first lease with nothing to settle. */
+    private static Lease firstLease(BudgetAuthority bank, int shard, long wanted, long now) {
+        return bank.requestLease(shard, 1L, Lease.NONE, 0L, wanted, now);
     }
 
-    @Test
-    @DisplayName("never hands out more than the budget, however hard it is asked")
-    void neverGrantsBeyondTheBudget() {
-        final BudgetAuthority bank = new BudgetAuthority(1_000L, 4);
+    @Nested
+    @DisplayName("leasing")
+    class Leasing {
 
-        for (int shard = 0; shard < 4; shard++) {
-            bank.requestAuthority(shard, 1L, 800L);
+        @Test
+        @DisplayName("issues a lease and reserves its full face value")
+        void issuesAndReserves() {
+            final BudgetAuthority bank = bank(1_000L, 2);
+            final Lease lease = firstLease(bank, 0, 300L, T0);
+
+            assertThat(lease).isNotNull();
+            assertThat(lease.amountMicros()).isEqualTo(300L);
+            assertThat(lease.expiresAtNanos()).isEqualTo(T0 + LEASE_DURATION);
+            // Reserved in full, because until told otherwise the authority must assume all of it
+            // will be spent.
+            assertThat(bank.outstandingMicros()).isEqualTo(300L);
+            assertThat(bank.headroomMicros()).isEqualTo(700L);
         }
-        for (int shard = 0; shard < 4; shard++) {
-            bank.requestAuthority(shard, 1L, 800L);
+
+        @Test
+        @DisplayName("never commits more than the budget")
+        void neverCommitsBeyondTheBudget() {
+            final BudgetAuthority bank = bank(1_000L, 4);
+            for (int shard = 0; shard < 4; shard++) {
+                bank.requestLease(shard, 1L, Lease.NONE, 0L, 800L, T0);
+            }
+
+            assertThat(bank.settledMicros() + bank.outstandingMicros()).isEqualTo(1_000L);
+            assertThat(bank.headroomMicros()).isZero();
+            assertThat(bank.leasesExhausted()).isPositive();
         }
 
-        // This is the single invariant the whole safety argument rests on.
-        assertThat(bank.totalGrantedMicros()).isEqualTo(1_000L);
-        assertThat(bank.unallocatedMicros()).isZero();
-        assertThat(bank.grantsExhausted()).isPositive();
+        @Test
+        @DisplayName("issues the partial remainder rather than refusing")
+        void issuesThePartialRemainder() {
+            final BudgetAuthority bank = bank(1_000L, 2);
+            firstLease(bank, 0, 900L, T0);
+
+            assertThat(firstLease(bank, 1, 500L, T0).amountMicros()).isEqualTo(100L);
+        }
+
+        @Test
+        @DisplayName("returns nothing when the budget is fully committed")
+        void refusesWhenExhausted() {
+            final BudgetAuthority bank = bank(100L, 2);
+            firstLease(bank, 0, 100L, T0);
+
+            assertThat(firstLease(bank, 1, 50L, T0)).isNull();
+        }
+
+        @Test
+        @DisplayName("gives every lease a distinct increasing id")
+        void leaseIdsIncrease() {
+            final BudgetAuthority bank = bank(1_000L, 1);
+            final long first = firstLease(bank, 0, 100L, T0).leaseId();
+            bank.requestLease(0, 1L, Lease.NONE, 0L, 100L, T0);
+            final Lease third = bank.requestLease(0, 1L, Lease.NONE, 0L, 100L, T0);
+
+            assertThat(third.leaseId()).isGreaterThan(first);
+        }
     }
 
-    @Test
-    @DisplayName("hands out the last partial amount rather than refusing outright")
-    void grantsThePartialRemainder() {
-        final BudgetAuthority bank = new BudgetAuthority(1_000L, 2);
-        bank.requestAuthority(0, 1L, 900L);
+    @Nested
+    @DisplayName("voluntary release")
+    class VoluntaryRelease {
 
-        assertThat(bank.requestAuthority(1, 1L, 500L)).isEqualTo(100L);
-        assertThat(bank.totalGrantedMicros()).isEqualTo(1_000L);
+        @Test
+        @DisplayName("settles the reported spend and returns the remainder")
+        void releaseReturnsTheRemainder() {
+            final BudgetAuthority bank = bank(1_000L, 1);
+            final Lease lease = firstLease(bank, 0, 500L, T0);
+
+            bank.requestLease(0, 1L, lease.leaseId(), 340L, 500L, T0);
+
+            // 340 spent, so 160 comes back and is available to lease again.
+            assertThat(bank.settledMicros()).isEqualTo(340L);
+            assertThat(bank.releasedMicros()).isEqualTo(160L);
+            assertThat(bank.settledMicros() + bank.outstandingMicros()).isEqualTo(840L);
+        }
+
+        @Test
+        @DisplayName("releasing the same lease twice does not double-count")
+        void releaseIsIdempotent() {
+            final BudgetAuthority bank = bank(1_000L, 1);
+            final Lease lease = firstLease(bank, 0, 500L, T0);
+
+            bank.requestLease(0, 1L, lease.leaseId(), 340L, 100L, T0);
+            final long settledOnce = bank.settledMicros();
+            bank.requestLease(0, 1L, lease.leaseId(), 340L, 100L, T0);
+
+            assertThat(bank.settledMicros()).isEqualTo(settledOnce);
+        }
+
+        @Test
+        @DisplayName("cannot be talked into settling more than the lease was worth")
+        void releaseIsCappedByTheLease() {
+            final BudgetAuthority bank = bank(1_000L, 1);
+            final Lease lease = firstLease(bank, 0, 500L, T0);
+
+            bank.requestLease(0, 1L, lease.leaseId(), 99_999L, 0L, T0);
+            assertThat(bank.settledMicros()).isEqualTo(500L);
+        }
+
+        @Test
+        @DisplayName("never settles below what was already reported")
+        void releaseCannotUndercutAReport() {
+            final BudgetAuthority bank = bank(1_000L, 1);
+            final Lease lease = firstLease(bank, 0, 500L, T0);
+            bank.recordReport(0, 1L, lease.leaseId(), 400L);
+
+            // A release claiming less than a report already seen would free money known to be
+            // spent, so the higher figure wins.
+            bank.requestLease(0, 1L, lease.leaseId(), 100L, 0L, T0);
+            assertThat(bank.settledMicros()).isEqualTo(400L);
+        }
     }
 
-    @Test
-    @DisplayName("a restarted shard begins again from zero")
-    void restartedShardStartsFromZero() {
-        final BudgetAuthority bank = new BudgetAuthority(1_000L, 1);
-        bank.requestAuthority(0, 1L, 400L);
+    @Nested
+    @DisplayName("unilateral reclaim")
+    class UnilateralReclaim {
 
-        // The restarted process has no idea what its predecessor spent, so it must not be
-        // told it already holds 400 — that would let it spend the same money twice.
-        assertThat(bank.requestAuthority(0, 2L, 100L)).isEqualTo(100L);
-        assertThat(bank.grantedMicros(0)).isEqualTo(500L);
-        assertThat(bank.totalGrantedMicros()).isEqualTo(500L);
-        assertThat(bank.restartsObserved()).isEqualTo(1L);
+        @Test
+        @DisplayName("waits for the margin to elapse before taking a lease back")
+        void respectsTheMargin() {
+            final BudgetAuthority bank = bank(1_000L, 1);
+            final Lease lease = firstLease(bank, 0, 500L, T0);
+            final long expiry = lease.expiresAtNanos();
+
+            assertThat(bank.reclaimExpired(expiry)).isZero();
+            assertThat(bank.reclaimExpired(expiry + MARGIN - 1)).isZero();
+            assertThat(bank.reclaimExpired(expiry + MARGIN)).isEqualTo(1);
+        }
+
+        @Test
+        @DisplayName("settles at the last reported figure and frees the rest")
+        void settlesAtTheLastReport() {
+            final BudgetAuthority bank = bank(1_000L, 1);
+            final Lease lease = firstLease(bank, 0, 500L, T0);
+            bank.recordReport(0, 1L, lease.leaseId(), 120L);
+
+            bank.reclaimExpired(lease.expiresAtNanos() + MARGIN);
+
+            // The authority is betting the missing 380 was never spent. That bet is the entire
+            // risk of unilateral reclaim, and it is bounded by the size of the lease.
+            assertThat(bank.settledMicros()).isEqualTo(120L);
+            assertThat(bank.reclaimedMicros()).isEqualTo(380L);
+            assertThat(bank.headroomMicros()).isEqualTo(880L);
+        }
+
+        @Test
+        @DisplayName("frees the whole lease when no report ever arrived")
+        void freesEverythingWhenUninformed() {
+            final BudgetAuthority bank = bank(1_000L, 1);
+            final Lease lease = firstLease(bank, 0, 500L, T0);
+
+            bank.reclaimExpired(lease.expiresAtNanos() + MARGIN);
+
+            // The worst case, and the reason lease size is the control for this exposure.
+            assertThat(bank.reclaimedMicros()).isEqualTo(500L);
+            assertThat(bank.headroomMicros()).isEqualTo(1_000L);
+        }
+
+        @Test
+        @DisplayName("never reclaims when configured not to")
+        void neverReclaimDisablesTheSweeper() {
+            final BudgetAuthority bank =
+                    new BudgetAuthority(1_000L, 1, LEASE_DURATION, BudgetAuthority.NEVER_RECLAIM);
+            firstLease(bank, 0, 500L, T0);
+
+            assertThat(bank.reclaimExpired(Long.MAX_VALUE)).isZero();
+            assertThat(bank.outstandingMicros()).isEqualTo(500L);
+        }
+
+        @Test
+        @DisplayName("leaves unexpired leases alone")
+        void leavesLiveLeasesAlone() {
+            final BudgetAuthority bank = bank(1_000L, 2);
+            firstLease(bank, 0, 200L, T0);
+            firstLease(bank, 1, 200L, T0 + 5_000L);
+
+            assertThat(bank.reclaimExpired(T0 + LEASE_DURATION + MARGIN)).isEqualTo(1);
+            assertThat(bank.outstandingLeaseCount()).isEqualTo(1);
+        }
     }
 
-    @Test
-    @DisplayName("a restart still counts the predecessor's authority against the budget")
-    void restartDoesNotRecoverThePredecessorsAuthority() {
-        final BudgetAuthority bank = new BudgetAuthority(1_000L, 1);
-        bank.requestAuthority(0, 1L, 1_000L);
+    @Nested
+    @DisplayName("reports")
+    class Reports {
 
-        // Nothing is left, because the dead process might have spent all of it.
-        assertThat(bank.requestAuthority(0, 2L, 500L)).isZero();
-        assertThat(bank.unallocatedMicros()).isZero();
+        @Test
+        @DisplayName("keeps the highest figure and ignores stale ones")
+        void reportsAreMonotonic() {
+            final BudgetAuthority bank = bank(1_000L, 1);
+            final Lease lease = firstLease(bank, 0, 500L, T0);
+
+            bank.recordReport(0, 1L, lease.leaseId(), 300L);
+            bank.recordReport(0, 1L, lease.leaseId(), 120L);
+            bank.reclaimExpired(lease.expiresAtNanos() + MARGIN);
+
+            assertThat(bank.settledMicros()).isEqualTo(300L);
+        }
+
+        @Test
+        @DisplayName("ignores a report for a lease it does not know")
+        void ignoresUnknownLease() {
+            final BudgetAuthority bank = bank(1_000L, 1);
+            firstLease(bank, 0, 500L, T0);
+
+            bank.recordReport(0, 1L, 999L, 400L);
+            bank.reclaimExpired(T0 + LEASE_DURATION + MARGIN);
+            assertThat(bank.settledMicros()).isZero();
+        }
     }
 
-    @Test
-    @DisplayName("refuses a request from a process that has already been replaced")
-    void supersededRequestIsRefused() {
-        final BudgetAuthority bank = new BudgetAuthority(1_000L, 1);
-        bank.requestAuthority(0, 2L, 100L);
+    @Nested
+    @DisplayName("restarts")
+    class Restarts {
 
-        assertThat(bank.requestAuthority(0, 1L, 100L)).isEqualTo(BudgetAuthority.SUPERSEDED);
-        assertThat(bank.grantsSuperseded()).isEqualTo(1L);
-        assertThat(bank.totalGrantedMicros()).isEqualTo(100L);
-    }
+        @Test
+        @DisplayName("a restarted shard gets a fresh lease and no inherited authority")
+        void restartStartsFresh() {
+            final BudgetAuthority bank = bank(1_000L, 1);
+            firstLease(bank, 0, 400L, T0);
 
-    @Test
-    @DisplayName("keeps the highest spend report and ignores stale ones")
-    void reportsAreMonotonic() {
-        final BudgetAuthority bank = new BudgetAuthority(1_000L, 1);
-        bank.requestAuthority(0, 1L, 500L);
+            final Lease afterRestart = bank.requestLease(0, 2L, Lease.NONE, 0L, 100L, T0);
+            assertThat(afterRestart.amountMicros()).isEqualTo(100L);
+            assertThat(bank.restartsObserved()).isEqualTo(1L);
+        }
 
-        bank.recordReport(0, 1L, 300L);
-        bank.recordReport(0, 1L, 120L);
-        bank.recordReport(0, 1L, 300L);
+        @Test
+        @DisplayName("the dead process's lease is left for the sweeper, not written off")
+        void deadLeaseIsSweptNotDiscarded() {
+            final BudgetAuthority bank = bank(1_000L, 1);
+            final Lease dead = firstLease(bank, 0, 400L, T0);
+            bank.requestLease(0, 2L, Lease.NONE, 0L, 100L, T0);
 
-        // Duplicates and reordering are ordinary on a network, so the report path has to be
-        // immune to both without keeping a table of what it has already seen.
-        assertThat(bank.reportedSpentMicros(0)).isEqualTo(300L);
-    }
+            assertThat(bank.outstandingLeaseCount()).isEqualTo(2);
 
-    @Test
-    @DisplayName("ignores a report from the wrong process")
-    void reportFromAnotherIncarnationIsIgnored() {
-        final BudgetAuthority bank = new BudgetAuthority(1_000L, 1);
-        bank.requestAuthority(0, 2L, 500L);
+            // A crashed process has certainly stopped spending, which makes its lease the safest
+            // possible thing to reclaim.
+            bank.reclaimExpired(dead.expiresAtNanos() + MARGIN);
+            assertThat(bank.reclaimedMicros()).isEqualTo(500L);
+        }
 
-        bank.recordReport(0, 1L, 400L);
-        assertThat(bank.reportedSpentMicros(0)).isZero();
+        @Test
+        @DisplayName("refuses a request from a process already replaced")
+        void supersededRequestIsRefused() {
+            final BudgetAuthority bank = bank(1_000L, 1);
+            bank.requestLease(0, 2L, Lease.NONE, 0L, 100L, T0);
 
-        bank.recordReport(0, 2L, 400L);
-        assertThat(bank.reportedSpentMicros(0)).isEqualTo(400L);
-    }
-
-    @Test
-    @DisplayName("accumulates reported spend across restarts")
-    void reportedSpendAccumulatesAcrossRestarts() {
-        final BudgetAuthority bank = new BudgetAuthority(10_000L, 1);
-        bank.requestAuthority(0, 1L, 1_000L);
-        bank.recordReport(0, 1L, 700L);
-
-        bank.requestAuthority(0, 2L, 1_000L);
-        bank.recordReport(0, 2L, 250L);
-
-        assertThat(bank.reportedSpentMicros(0)).isEqualTo(950L);
-    }
-
-    @Test
-    @DisplayName("accounts for the money a crash left behind")
-    void tracksBudgetStrandedByRestarts() {
-        final BudgetAuthority bank = new BudgetAuthority(10_000L, 1);
-        bank.requestAuthority(0, 1L, 1_000L);
-        bank.recordReport(0, 1L, 400L);
-
-        bank.requestAuthority(0, 2L, 1_000L);
-
-        // 1,000 granted, 400 known spent, so 600 is unrecoverable: it may have been spent
-        // without ever being reported, and assuming otherwise is how overspend happens.
-        assertThat(bank.strandedByRestartsMicros()).isEqualTo(600L);
-    }
-
-    @Test
-    @DisplayName("a zero budget grants nothing")
-    void zeroBudgetGrantsNothing() {
-        final BudgetAuthority bank = new BudgetAuthority(0L, 1);
-        assertThat(bank.requestAuthority(0, 1L, 100L)).isZero();
+            assertThat(bank.requestLease(0, 1L, Lease.NONE, 0L, 100L, T0)).isNull();
+            assertThat(bank.leasesSuperseded()).isEqualTo(1L);
+        }
     }
 
     @Test
     @DisplayName("rejects an unknown shard")
     void rejectsUnknownShard() {
-        final BudgetAuthority bank = new BudgetAuthority(1_000L, 2);
-        assertThatThrownBy(() -> bank.requestAuthority(2, 1L, 100L))
+        final BudgetAuthority bank = bank(1_000L, 2);
+        assertThatThrownBy(() -> bank.requestLease(2, 1L, Lease.NONE, 0L, 100L, T0))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("shardId");
+    }
+
+    @Test
+    @DisplayName("rejects a non-positive lease duration")
+    void rejectsBadLeaseDuration() {
+        assertThatThrownBy(() -> new BudgetAuthority(1_000L, 1, 0L, MARGIN))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("leaseDurationNanos");
     }
 }

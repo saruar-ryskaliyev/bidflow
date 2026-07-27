@@ -1,42 +1,37 @@
 package io.bidflow.budget;
 
 /**
- * One serving shard's wallet: the money it is currently allowed to spend without asking
- * anyone.
+ * One serving shard's wallet: the time-limited money it may spend without asking anyone.
  *
- * <p>This sits directly on the request path, so it does one subtraction, one comparison, and
- * one addition. No locks, no allocation, no network. Whether an ad can afford to show is
- * answered from two {@code long} fields and nothing else — which is the entire point, because
- * consulting a central service would cost milliseconds inside a microsecond budget.
+ * <p>{@link #tryReserve} sits on the request path and does two comparisons and an addition. No
+ * locks, no allocation, no network, and no clock read — the caller supplies the current time,
+ * because a serving thread already has a timestamp for its own logging and reading the clock
+ * twice for one decision is waste at this scale.
  *
- * <h2>Why both numbers are cumulative</h2>
+ * <h2>Why spending stops at the deadline</h2>
  *
- * <p>The wallet tracks lifetime totals rather than a decrementing remainder, and grants
- * arrive as "your total authority is now N" rather than "here is 200 more". That choice makes
- * the protocol survive a bad network for free.
+ * <p>Refusing to spend past the lease expiry is what lets the authority reclaim money from a
+ * shard it can no longer reach. The authority waits until the deadline has passed by a safety
+ * margin and then takes the remainder back, and that is only sound if the holder really did
+ * stop.
  *
- * <p>An incremental grant is dangerous: if "here is 200 more" is delivered twice — and a retry
- * of a message that was merely slow rather than lost looks exactly like that — the shard ends
- * up with 400 and overspends. A cumulative grant applied twice is harmless, because setting a
- * total to N twice leaves it at N. The same reasoning makes out-of-order delivery safe, since
- * {@link #applyGrant} keeps the highest total it has seen and a stale grant cannot claw back
- * authority already held.
+ * <p>The catch is that the deadline is expressed on the authority's clock while this wallet can
+ * only compare it against its own. If this shard's clock runs slow it keeps spending past the
+ * moment the authority thinks the lease died. The overlap is bounded by the clock disagreement,
+ * so the authority's safety margin has to cover it — that relationship is the whole subject of
+ * the reclaim experiment, and it is why {@link io.bidflow.sim.NodeClock} exists.
  *
- * <h2>Incarnations</h2>
+ * <h2>Sealing</h2>
  *
- * <p>This object lives in memory, so a process crash destroys it. That matters more than it
- * looks: the replacement wallet has no idea what its predecessor spent, so if it were handed
- * the shard's lifetime authority total it would treat every micro already spent as still
- * available and cheerfully spend the budget twice.
+ * <p>Renewal is a two-part move: seal, then ask. {@link #sealForRenewal} stops spending and
+ * returns a final figure, and only then does the shard tell the authority "lease 7 spent 340 of
+ * its 500, please issue another". Sealing first is what makes that number trustworthy — report
+ * a running total while still spending and the authority reclaims money that has since gone
+ * out the door.
  *
- * <p>So a wallet belongs to an <em>incarnation</em> — one lifetime of one process. A restarted
- * shard is a new incarnation starting from zero authority, and grants are scoped to the
- * incarnation that asked for them, so a reply intended for a dead predecessor is discarded
- * rather than applied. The authority its predecessor held is written off rather than reused,
- * which is safe and wasteful, and that waste is the thing worth measuring.
- *
- * <p>Money is {@code long} micros throughout, never floating point, so spend replays exactly
- * for billing.
+ * <p>The cost is a serving gap of one round trip per renewal, during which this shard can spend
+ * nothing. That is a real cost, but a small one: a lease lasting hundreds of milliseconds and a
+ * round trip of hundreds of microseconds put the gap under a tenth of a percent.
  *
  * <p><b>Not thread-safe.</b> One instance per request-handling thread.
  */
@@ -45,72 +40,114 @@ public final class SpendAuthority {
     private final int shardId;
     private final long incarnation;
 
-    /** Micros this incarnation has been authorised to spend. Never decreases. */
-    private long authorityMicros;
+    private long leaseId = Lease.NONE;
+    private long leaseAmountMicros;
+    private long leaseSpentMicros;
+    private long leaseExpiresAtNanos;
 
-    /** Micros this incarnation has committed. Never decreases. */
-    private long spentMicros;
+    /** Set when spending has stopped so that the reported figure is final. */
+    private boolean sealed;
+
+    private long lifetimeSpentMicros;
 
     /**
-     * @param shardId which serving shard this wallet belongs to
-     * @param incarnation strictly increasing per restart of that shard, so that grants aimed
-     *     at a previous process are recognisable and can be ignored
+     * @param incarnation strictly increasing per restart of this shard, so grants aimed at a
+     *     dead predecessor are recognisable. The wallet lives in memory and dies with its
+     *     process, and a replacement that inherited its predecessor's authority would respend
+     *     money already spent.
      */
     public SpendAuthority(int shardId, long incarnation) {
         if (shardId < 0) {
             throw new IllegalArgumentException("shardId must not be negative, was " + shardId);
         }
-        if (incarnation < 0) {
-            throw new IllegalArgumentException("incarnation must not be negative, was " + incarnation);
+        if (incarnation <= 0) {
+            throw new IllegalArgumentException("incarnation must be positive, was " + incarnation);
         }
         this.shardId = shardId;
         this.incarnation = incarnation;
     }
 
     /**
-     * Commits {@code amountMicros} of spend if this wallet still has the authority for it.
+     * Commits spend against the current lease.
      *
-     * <p>The hot path. Returns false rather than throwing when the wallet is empty, because
-     * running out of budget is an ordinary outcome — the ad simply does not show.
+     * <p>The hot path. Returns false rather than throwing for every ordinary refusal — out of
+     * money, past the deadline, sealed for renewal — because none of those are errors. The ad
+     * simply does not show.
      *
-     * @return true if the spend was committed
+     * @param nowNanos this shard's own reading of the clock
      */
-    public boolean tryReserve(long amountMicros) {
+    public boolean tryReserve(long nowNanos, long amountMicros) {
         if (amountMicros < 0) {
             throw new IllegalArgumentException("amountMicros must not be negative, was " + amountMicros);
         }
-        // Written as a subtraction on the remaining side rather than an addition on the spent
-        // side, so a huge amount cannot overflow the comparison into passing.
-        if (authorityMicros - spentMicros < amountMicros) {
+        if (sealed || leaseId == Lease.NONE || nowNanos >= leaseExpiresAtNanos) {
             return false;
         }
-        spentMicros += amountMicros;
+        // Compared on the remaining side rather than by adding to the spent side, so a huge
+        // amount cannot overflow its way past the check.
+        if (leaseAmountMicros - leaseSpentMicros < amountMicros) {
+            return false;
+        }
+        leaseSpentMicros += amountMicros;
+        lifetimeSpentMicros += amountMicros;
         return true;
     }
 
     /**
-     * Applies a grant, which states this incarnation's total authority rather than an
-     * increment.
+     * Adopts a newly granted lease.
      *
-     * <p>Ignored unless the grant was issued to this incarnation. Keeping the maximum is what
-     * makes it safe to apply the same grant twice, or out of order, or both.
+     * <p>Refuses a lease not newer than the one held, which makes a duplicated or reordered
+     * grant a no-op. Also refuses to displace a lease that is still live and unsealed: doing so
+     * would discard that lease's spend record while the authority still expects to be told it,
+     * and the authority would then reclaim money that had already been spent.
      *
-     * @return true if the grant changed anything
+     * @return true if the lease was adopted
      */
-    public boolean applyGrant(long grantIncarnation, long totalAuthorityMicros) {
-        if (grantIncarnation != incarnation) {
+    public boolean installLease(Lease lease, long nowNanos) {
+        if (lease.leaseId() <= leaseId) {
             return false;
         }
-        if (totalAuthorityMicros <= authorityMicros) {
+        final boolean replaceable =
+                leaseId == Lease.NONE || sealed || nowNanos >= leaseExpiresAtNanos;
+        if (!replaceable) {
             return false;
         }
-        authorityMicros = totalAuthorityMicros;
+        leaseId = lease.leaseId();
+        leaseAmountMicros = lease.amountMicros();
+        leaseExpiresAtNanos = lease.expiresAtNanos();
+        leaseSpentMicros = 0L;
+        sealed = false;
         return true;
     }
 
-    /** True when the wallet has fallen low enough to be worth topping up. */
-    public boolean needsTopUp(long thresholdMicros) {
-        return remainingMicros() <= thresholdMicros;
+    /**
+     * Stops spending on the current lease and returns what it spent, ready to report.
+     *
+     * <p>Idempotent: once sealed the figure cannot move, so a retried renewal request carries
+     * the same number.
+     */
+    public long sealForRenewal() {
+        sealed = true;
+        return leaseSpentMicros;
+    }
+
+    /** True when it is time to seal and ask for another lease. */
+    public boolean needsLease(long nowNanos, long lowWaterMicros, long renewAheadNanos) {
+        if (sealed || leaseId == Lease.NONE) {
+            return true;
+        }
+        if (nowNanos >= leaseExpiresAtNanos - renewAheadNanos) {
+            return true;
+        }
+        return remainingMicros() <= lowWaterMicros;
+    }
+
+    public boolean isExpired(long nowNanos) {
+        return leaseId == Lease.NONE || nowNanos >= leaseExpiresAtNanos;
+    }
+
+    public boolean isSealed() {
+        return sealed;
     }
 
     public int shardId() {
@@ -121,16 +158,30 @@ public final class SpendAuthority {
         return incarnation;
     }
 
+    public long leaseId() {
+        return leaseId;
+    }
+
+    /** Unspent authority on the current lease, ignoring whether it is still valid. */
     public long remainingMicros() {
-        return authorityMicros - spentMicros;
+        return leaseAmountMicros - leaseSpentMicros;
     }
 
-    /** This incarnation's spend, which is what gets reported back to the authority. */
-    public long spentMicros() {
-        return spentMicros;
+    public long leaseAmountMicros() {
+        return leaseAmountMicros;
     }
 
-    public long authorityMicros() {
-        return authorityMicros;
+    /** Spend against the current lease, which is what gets reported. */
+    public long leaseSpentMicros() {
+        return leaseSpentMicros;
+    }
+
+    public long leaseExpiresAtNanos() {
+        return leaseExpiresAtNanos;
+    }
+
+    /** Spend across every lease this incarnation has held. */
+    public long lifetimeSpentMicros() {
+        return lifetimeSpentMicros;
     }
 }
