@@ -1,0 +1,523 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>bidflow — live auction demo</title>
+<style>
+  :root {
+    --text: #1a1a1a;
+    --muted: #666666;
+    --faint: #8f8f8f;
+    --line: #e4e4e4;
+    --hover: #f7f7f7;
+    --control: #cfcfcf;
+    --ok: #137333;
+    --bad: #b3261e;
+  }
+  * { box-sizing: border-box; margin: 0; }
+  body {
+    background: #fff;
+    color: var(--text);
+    font: 14px/1.55 ui-sans-serif, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    max-width: 1060px;
+    margin: 0 auto;
+    padding: 40px 24px 72px;
+  }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.92em; }
+  .num { font-variant-numeric: tabular-nums; }
+
+  header { display: flex; justify-content: space-between; align-items: flex-start; gap: 24px; flex-wrap: wrap; }
+  h1 { font-size: 20px; font-weight: 600; letter-spacing: -0.01em; }
+  h2 { font-size: 15px; font-weight: 600; }
+  .sub { color: var(--muted); margin-top: 6px; max-width: 620px; }
+  .actions { display: flex; gap: 8px; align-items: center; }
+
+  section.panel, section.explainer, .users {
+    border-top: 1px solid var(--line);
+    margin-top: 36px;
+    padding-top: 28px;
+  }
+
+  button {
+    background: #fff; color: var(--text); border: 1px solid var(--control); border-radius: 4px;
+    padding: 5px 12px; font: inherit; font-size: 13px; cursor: pointer;
+  }
+  button:hover { background: var(--hover); }
+  button.primary { background: var(--text); border-color: var(--text); color: #fff; }
+  button.primary:hover { background: #3a3a3a; }
+  button.ghost { border-color: transparent; background: none; color: var(--muted); padding: 3px 7px; }
+  button.ghost:hover { color: var(--text); background: var(--hover); }
+  button:disabled { opacity: 0.4; cursor: default; }
+  button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px solid var(--text); outline-offset: 1px; }
+
+  select, input {
+    background: #fff; color: var(--text); border: 1px solid var(--control);
+    border-radius: 4px; padding: 4px 8px; font: inherit; font-size: 13px;
+  }
+  input[type=number] { width: 90px; }
+
+  .explainer { display: grid; grid-template-columns: repeat(3, 1fr); gap: 32px; }
+  .explainer h3 { font-size: 13px; font-weight: 600; margin-bottom: 4px; }
+  .explainer p { color: var(--muted); font-size: 13px; }
+
+  .panel-head { display: flex; justify-content: space-between; align-items: baseline; gap: 16px; flex-wrap: wrap; margin-bottom: 16px; }
+  .hint { color: var(--faint); font-size: 12.5px; }
+
+  table { width: 100%; border-collapse: collapse; }
+  th { text-align: left; color: var(--muted); font-size: 12px; font-weight: 500; padding: 6px 10px; border-bottom: 1px solid var(--line); }
+  td { padding: 10px; border-bottom: 1px solid var(--line); vertical-align: middle; font-size: 13.5px; }
+  td b { font-weight: 600; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 8px; }
+  .mult { color: var(--faint); font-size: 12px; margin-left: 6px; }
+  .bar { height: 3px; background: #ececec; margin-top: 6px; min-width: 120px; }
+  .bar i { display: block; height: 100%; background: var(--text); }
+  .cell-sub { color: var(--muted); font-size: 12px; }
+  .pill { font-size: 12.5px; color: var(--muted); }
+  .pill.ok { color: var(--ok); }
+  .pill.bad { color: var(--bad); }
+
+  .users { display: grid; grid-template-columns: 1fr 1fr; gap: 48px; }
+  .user-card { min-width: 0; }
+  .user-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+  .user-head h2 { font-size: 14.5px; }
+  .user-head .persona { color: var(--muted); font-weight: 400; }
+  .query { color: var(--faint); font-size: 12.5px; margin: 2px 0 12px; }
+  .slot { padding: 12px 8px; border-top: 1px solid var(--line); cursor: pointer; }
+  .slot:hover { background: var(--hover); }
+  .slot .top { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
+  .slot .name { font-weight: 600; font-size: 13.5px; }
+  .slot .ad-tag { font-size: 11px; font-weight: 400; color: var(--muted); margin-left: 8px; }
+  .slot .price { font-weight: 600; white-space: nowrap; font-size: 13px; }
+  .slot .math { color: var(--faint); font-size: 12px; margin-top: 3px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .excluded { color: var(--faint); font-size: 12px; padding: 10px 8px; border-top: 1px solid var(--line); }
+  .organic { border-top: 1px solid var(--line); padding: 12px 8px 0; color: var(--faint); font-size: 12.5px; }
+  .organic .o-title { color: var(--muted); }
+  .placeholder { color: var(--faint); padding: 20px 0; }
+
+  #chartWrap { display: none; margin-top: 8px; }
+  #legend { display: flex; gap: 20px; flex-wrap: wrap; margin-top: 6px; color: var(--muted); font-size: 12.5px; }
+  svg text { fill: var(--faint); font-size: 10.5px; font-family: inherit; }
+
+  .add-form { display: flex; gap: 14px; align-items: center; flex-wrap: wrap; margin-top: 14px; }
+  .add-form label { color: var(--muted); font-size: 12.5px; display: flex; gap: 6px; align-items: center; }
+  .add-form input[type=text] { width: 200px; }
+  .settings label { display: inline-flex; gap: 6px; align-items: center; }
+  .settings input[type=number] { width: 90px; }
+
+  footer { color: var(--faint); font-size: 12.5px; margin-top: 40px; padding-top: 24px; border-top: 1px solid var(--line); max-width: 820px; }
+  #toast {
+    position: fixed; right: 20px; bottom: 20px; background: var(--text); color: #fff;
+    border-radius: 4px; padding: 10px 14px; font-size: 13px; opacity: 0; transition: opacity 0.2s;
+    pointer-events: none; max-width: 340px;
+  }
+  #toast.bad { background: var(--bad); }
+  #toast.show { opacity: 1; }
+  @media (max-width: 860px) {
+    .users, .explainer { grid-template-columns: 1fr; }
+    .users { gap: 28px; }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div>
+    <h1>bidflow demo</h1>
+    <p class="sub">Runs the project’s real <code>AuctionEngine</code> and budget module in one JVM.
+    Two users search the same market: quality scores personalise the ranking, and clicks spend leased budget until campaigns drop out.</p>
+  </div>
+  <div class="actions">
+    <select id="budgetSelect" title="Budget per campaign after reset">
+      <option value="300000">budget 300,000 µ</option>
+      <option value="500000" selected>budget 500,000 µ</option>
+      <option value="1000000">budget 1,000,000 µ</option>
+    </select>
+    <button id="resetBtn">Load example scenario</button>
+  </div>
+</header>
+
+<section class="explainer">
+  <div class="card">
+    <h3>Per request, not per profile</h3>
+    <p>Every search runs a fresh auction. The engine is a pure function — “the user” enters only through the
+    quality score, a predicted click-through rate supplied per user and query.</p>
+  </div>
+  <div class="card">
+    <h3>Time lives in the budget layer</h3>
+    <p>Wallets hold time-limited leases over slices of each campaign’s budget. Clicks decrement locally with no
+    network on the serving path; renewal is seal-then-ask; exhausted campaigns stop showing.</p>
+  </div>
+  <div class="card">
+    <h3>What this demo collapses</h3>
+    <p>One process, one clock: no skew, partitions, or crashes, so overspend is structurally zero here.
+    Those failure modes are covered by the deterministic simulation tests (120 seeds).</p>
+  </div>
+</section>
+
+<section class="panel">
+  <div class="panel-head">
+    <h2>Campaigns</h2>
+    <span class="settings hint">
+      <label>ad slots <select id="slotsSel"><option>1</option><option>2</option><option selected>3</option><option>4</option><option>5</option></select></label>
+      <label>reserve µ <input type="number" id="reserveInput" value="10000" min="0" step="5000"></label>
+      · quality is basis points, 10,000 = ×1.00
+    </span>
+  </div>
+  <table>
+    <thead>
+      <tr>
+        <th>Campaign</th><th>Bid (µ)</th><th>Quality — user A</th><th>Quality — user B</th>
+        <th>Budget</th><th>Wallet lease</th><th>Status</th><th></th>
+      </tr>
+    </thead>
+    <tbody id="campaignRows"></tbody>
+  </table>
+  <div class="add-form">
+    <input type="text" id="addName" placeholder="your campaign name" maxlength="40">
+    <label>bid µ <input type="number" id="addBid" value="70000" min="0" step="5000"></label>
+    <label>quality A <input type="number" id="addQA" value="5000" min="1" max="10000" step="250"></label>
+    <label>quality B <input type="number" id="addQB" value="5000" min="1" max="10000" step="250"></label>
+    <label>budget µ <input type="number" id="addBudget" value="500000" min="10000" step="50000"></label>
+    <button id="addBtn">Add campaign</button>
+  </div>
+</section>
+
+<div class="users">
+  <div class="user-card">
+    <div class="user-head">
+      <h2>User A <span class="persona">— sneaker collector</span></h2>
+      <button class="primary" data-search="A">Search</button>
+    </div>
+    <div class="query">searches the market</div>
+    <div data-results="A"><div class="placeholder">Press “Search” to run this user’s auction.</div></div>
+  </div>
+  <div class="user-card">
+    <div class="user-head">
+      <h2>User B <span class="persona">— marathon runner</span></h2>
+      <button class="primary" data-search="B">Search</button>
+    </div>
+    <div class="query">searches the market</div>
+    <div data-results="B"><div class="placeholder">Press “Search” to run this user’s auction.</div></div>
+  </div>
+</div>
+
+<section class="panel">
+  <div class="panel-head">
+    <h2>Traffic simulation</h2>
+    <button id="trafficBtn">Run 50 searches (A/B alternating)</button>
+  </div>
+  <p class="hint" id="chartHint">Clicks are drawn from each ad’s quality score, weighted by position.
+  More relevant campaigns pay less per click and outlast bigger bidders; a campaign leaves the page when its budget is exhausted.</p>
+  <div id="chartWrap">
+    <svg id="chart" viewBox="0 0 720 240" width="100%" preserveAspectRatio="xMidYMid meet"></svg>
+    <div id="legend"></div>
+  </div>
+</section>
+
+<footer>
+  Charged spend is tallied by the demo itself, outside the components under test — the same ground-truth habit the
+  simulation harness uses. Money is integer micros end to end; prices come from
+  <code>price = ceil(rank<sub>below</sub> ÷ own quality)</code>, so no advertiser ever pays above its bid.
+</footer>
+
+<div id="toast"></div>
+
+<script>
+"use strict";
+
+const COLORS = ["#4062a8", "#3a7d5c", "#a8742e", "#7a4fa0", "#a8453e", "#31768f", "#a04f7e", "#6c7d33"];
+const state = { data: null };
+const esc = (s) => String(s).replace(/[&<>"']/g,
+  (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]));
+
+const fmt = (n) => Number(n).toLocaleString("en-US");
+const mult = (bps) => "\u00d7" + (bps / 10000).toFixed(2);
+const sci = (rank) => (rank / 1e8).toFixed(1) + "\u00d710\u2078";
+
+async function refresh() {
+  const res = await fetch("/api/state");
+  state.data = await res.json();
+  render();
+}
+
+async function post(url) {
+  const res = await fetch(url, { method: "POST" });
+  return res.json();
+}
+
+function toast(message, bad) {
+  const el = document.getElementById("toast");
+  el.textContent = message;
+  el.className = bad ? "bad show" : "show";
+  clearTimeout(el._t);
+  el._t = setTimeout(() => { el.className = ""; }, 2600);
+}
+
+function colorOf(campaignId) {
+  const index = state.data.campaigns.findIndex((c) => c.id === campaignId);
+  return COLORS[index % COLORS.length];
+}
+
+/* ---------------- campaigns table ---------------- */
+
+function buildCampaignRows() {
+  const body = document.getElementById("campaignRows");
+  body.innerHTML = "";
+  state.data.campaigns.forEach((c, i) => {
+    const tr = document.createElement("tr");
+    tr.dataset.id = c.id;
+    tr.innerHTML = `
+      <td><span class="dot" style="background:${COLORS[i % COLORS.length]}"></span><b>${esc(c.name)}</b></td>
+      <td><input type="number" data-field="bid" min="0" max="1000000000" step="5000" value="${c.bidMicros}"></td>
+      <td><input type="number" data-field="qualityA" min="1" max="10000" step="250" value="${c.qualityA}"><span class="mult" data-mult="A">${mult(c.qualityA)}</span></td>
+      <td><input type="number" data-field="qualityB" min="1" max="10000" step="250" value="${c.qualityB}"><span class="mult" data-mult="B">${mult(c.qualityB)}</span></td>
+      <td><span class="cell-sub num" data-cell="budget"></span><div class="bar"><i data-cell="budgetBar"></i></div></td>
+      <td class="cell-sub num" data-cell="lease"></td>
+      <td data-cell="status"></td>
+      <td><button class="ghost mini" data-remove title="Remove this campaign">&#10005;</button></td>`;
+    tr.querySelectorAll("input").forEach((input) => {
+      input.addEventListener("change", async () => {
+        const field = input.dataset.field;
+        const value = input.value;
+        const param = field === "bid" ? "bid" : field;
+        const res = await post(`/api/campaign?id=${c.id}&${param}=${value}`);
+        if (res.error) toast(res.error, true);
+        refresh();
+      });
+    });
+    tr.querySelector("[data-remove]").addEventListener("click", async () => {
+      const res = await post(`/api/campaign/remove?id=${c.id}`);
+      if (res.error) toast(res.error, true);
+      else toast("Campaign removed.");
+      refresh();
+    });
+    body.appendChild(tr);
+  });
+}
+
+function updateCampaignRows() {
+  state.data.campaigns.forEach((c) => {
+    const tr = document.querySelector(`tr[data-id="${c.id}"]`);
+    if (!tr) return;
+    tr.querySelectorAll("input").forEach((input) => {
+      if (document.activeElement === input) return;
+      const field = input.dataset.field;
+      input.value = field === "bid" ? c.bidMicros : field === "qualityA" ? c.qualityA : c.qualityB;
+    });
+    tr.querySelector('[data-mult="A"]').textContent = mult(c.qualityA);
+    tr.querySelector('[data-mult="B"]').textContent = mult(c.qualityB);
+    tr.querySelector('[data-cell="budget"]').textContent = `${fmt(c.chargedMicros)} / ${fmt(c.budgetMicros)} µ charged`;
+    tr.querySelector('[data-cell="budgetBar"]').style.width =
+      Math.min(100, (100 * c.chargedMicros) / c.budgetMicros) + "%";
+    const lease = tr.querySelector('[data-cell="lease"]');
+    lease.textContent = c.walletExpiresInMillis < 0
+      ? "no lease yet"
+      : `${fmt(c.walletRemainingMicros)} µ · expires ${(c.walletExpiresInMillis / 1000).toFixed(0)}s`;
+    lease.title = `authority: settled ${fmt(c.settledMicros)} µ · outstanding ${fmt(c.outstandingMicros)} µ · headroom ${fmt(c.headroomMicros)} µ`;
+    tr.querySelector('[data-cell="status"]').innerHTML = statusPill(c);
+  });
+}
+
+function statusPill(c) {
+  if (c.serving) return '<span class="pill ok">serving</span>';
+  if (c.walletExpiresInMillis < 0 && c.headroomMicros > 0) return '<span class="pill">no lease yet</span>';
+  if (c.headroomMicros + c.walletRemainingMicros < c.bidMicros) return '<span class="pill bad">exhausted</span>';
+  return '<span class="pill">renewing</span>';
+}
+
+/* ---------------- user result pages ---------------- */
+
+function renderResults(user) {
+  const container = document.querySelector(`[data-results="${user}"]`);
+  const page = state.data.auctions[user];
+  if (!page) {
+    container.innerHTML = '<div class="placeholder">Press “Search” to run this user’s auction.</div>';
+    return;
+  }
+
+  let html = "";
+  page.forEach((slot, k) => {
+    html += `
+      <div class="slot" data-user="${user}" data-slot="${k}" title="Simulate a click — charges the campaign's wallet">
+        <div class="top">
+          <span class="name"><span class="dot" style="background:${colorOf(slot.campaignId)}"></span>${k + 1}. ${esc(slot.name)}<span class="ad-tag">Sponsored</span></span>
+          <span class="price num">pays ${fmt(slot.priceMicros)} µ / click</span>
+        </div>
+        <div class="math num">rank = bid ${fmt(slot.bidMicros)} ${mult(slot.qualityBps)} = ${sci(slot.adRank)}</div>
+      </div>`;
+  });
+  if (page.length === 0) {
+    html += '<div class="placeholder">No ads eligible — organic results only.</div>';
+  }
+
+  const missing = excludedLine(user, page);
+  if (missing) html += `<div class="excluded">${missing}</div>`;
+
+  html += `
+    <div class="organic">
+      <div class="o-title">Organic — the unpaid result your ads compete with</div>
+      <div>example.org</div>
+    </div>`;
+
+  container.innerHTML = html;
+  container.querySelectorAll(".slot").forEach((el) => {
+    el.addEventListener("click", async () => {
+      const res = await post(`/api/click?user=${el.dataset.user}&slot=${el.dataset.slot}`);
+      if (res.charged) toast("Click charged to the campaign’s lease.");
+      else toast("Click refused — the wallet can’t cover it, so the advertiser is not charged.", true);
+      refresh();
+    });
+  });
+}
+
+function excludedLine(user, page) {
+  const shown = new Set(page.map((s) => s.campaignId));
+  const reserveRank = state.data.params.reserveMicros * 10000;
+  const reasons = [];
+  state.data.campaigns.forEach((c) => {
+    if (shown.has(c.id)) return;
+    const quality = user === "A" ? c.qualityA : c.qualityB;
+    if (!c.serving) reasons.push(`${esc(c.name)}: budget can’t cover a click`);
+    else if (c.bidMicros * quality < reserveRank) reasons.push(`${esc(c.name)}: below reserve`);
+    else reasons.push(`${esc(c.name)}: outranked`);
+  });
+  return reasons.length ? "not shown — " + reasons.join(" · ") : "";
+}
+
+/* ---------------- traffic chart ---------------- */
+
+function renderChart() {
+  const t = state.data.timeline;
+  const wrap = document.getElementById("chartWrap");
+  const hint = document.getElementById("chartHint");
+  if (!t.series || t.series.length < 2 || state.data.campaigns.length === 0) {
+    wrap.style.display = "none";
+    hint.style.display = "";
+    return;
+  }
+  wrap.style.display = "block";
+  hint.style.display = "none";
+
+  const W = 720, H = 240, L = 56, R = 16, T = 14, B = 26;
+  const budgets = state.data.campaigns.map((c) => c.budgetMicros);
+  const uniform = budgets.every((b) => b === budgets[0]);
+  const n = t.series.length;
+  let top = Math.max(...budgets);
+  t.series.forEach((row) => row.forEach((v) => { if (v > top) top = v; }));
+  const yMax = top * 1.06;
+
+  const x = (i) => L + (i * (W - L - R)) / Math.max(1, n - 1);
+  const y = (v) => T + (H - T - B) * (1 - v / yMax);
+
+  let svg = "";
+  [0, 0.5, 1].forEach((f) => {
+    const value = f * top;
+    svg += `<line x1="${L}" y1="${y(value)}" x2="${W - R}" y2="${y(value)}" stroke="var(--line)" stroke-width="1"/>`;
+    svg += `<text x="${L - 8}" y="${y(value) + 3.5}" text-anchor="end">${fmt(Math.round(value / 1000))}k</text>`;
+  });
+  if (uniform) {
+    svg += `<line x1="${L}" y1="${y(budgets[0])}" x2="${W - R}" y2="${y(budgets[0])}" stroke="#9a9a9a" stroke-width="1" stroke-dasharray="5 4"/>`;
+    svg += `<text x="${W - R}" y="${y(budgets[0]) - 6}" text-anchor="end" fill="var(--muted)">budget</text>`;
+  }
+  svg += `<text x="${(L + W - R) / 2}" y="${H - 6}" text-anchor="middle">search # (µ charged, cumulative)</text>`;
+
+  t.names.forEach((name, c) => {
+    const points = t.series.map((row, i) => `${x(i).toFixed(1)},${y(row[c]).toFixed(1)}`).join(" ");
+    svg += `<polyline points="${points}" fill="none" stroke="${COLORS[c % COLORS.length]}" stroke-width="2"/>`;
+  });
+  document.getElementById("chart").innerHTML = svg;
+
+  const last = t.series[n - 1];
+  document.getElementById("legend").innerHTML = t.names
+    .map((name, c) =>
+      `<span><span class="dot" style="background:${COLORS[c % COLORS.length]}"></span>${esc(name)} — <span class="num">${fmt(last[c])} µ</span></span>`)
+    .join("");
+}
+
+/* ---------------- wiring ---------------- */
+
+function render() {
+  const body = document.getElementById("campaignRows");
+  const ids = state.data.campaigns.map((c) => c.id).join(",");
+  if (body.dataset.ids !== ids) {
+    buildCampaignRows();
+    body.dataset.ids = ids;
+  }
+  updateCampaignRows();
+  syncSettings();
+  renderResults("A");
+  renderResults("B");
+  renderChart();
+}
+
+function syncSettings() {
+  const p = state.data.params;
+  const slotsSel = document.getElementById("slotsSel");
+  const reserveInput = document.getElementById("reserveInput");
+  if (document.activeElement !== slotsSel) slotsSel.value = p.slots;
+  if (document.activeElement !== reserveInput) reserveInput.value = p.reserveMicros;
+  const addBtn = document.getElementById("addBtn");
+  addBtn.disabled = state.data.campaigns.length >= p.maxCampaigns;
+  addBtn.title = addBtn.disabled ? `the engine is sized for ${p.maxCampaigns} candidates` : "";
+  document.querySelectorAll(".query").forEach((el) => {
+    el.textContent = `${p.slots} ad slot${p.slots > 1 ? "s" : ""} · reserve ${fmt(p.reserveMicros)} µ · click an ad to charge its wallet`;
+  });
+}
+
+document.querySelectorAll("[data-search]").forEach((btn) => {
+  btn.addEventListener("click", async () => {
+    await post(`/api/search?user=${btn.dataset.search}`);
+    refresh();
+  });
+});
+
+document.getElementById("trafficBtn").addEventListener("click", async () => {
+  await post("/api/traffic?count=50");
+  toast("Ran 50 searches.");
+  refresh();
+});
+
+document.getElementById("resetBtn").addEventListener("click", async () => {
+  const budget = document.getElementById("budgetSelect").value;
+  await post(`/api/reset?budget=${budget}`);
+  toast("Example scenario loaded.");
+  refresh();
+});
+
+async function pushSettings() {
+  const slots = document.getElementById("slotsSel").value;
+  const reserve = document.getElementById("reserveInput").value;
+  const res = await post(`/api/settings?slots=${slots}&reserve=${reserve}`);
+  if (res.error) toast(res.error, true);
+  refresh();
+}
+document.getElementById("slotsSel").addEventListener("change", pushSettings);
+document.getElementById("reserveInput").addEventListener("change", pushSettings);
+
+document.getElementById("addBtn").addEventListener("click", async () => {
+  const name = document.getElementById("addName").value.trim();
+  if (!name) {
+    toast("Give the campaign a name.", true);
+    return;
+  }
+  const bid = document.getElementById("addBid").value;
+  const qa = document.getElementById("addQA").value;
+  const qb = document.getElementById("addQB").value;
+  const budget = document.getElementById("addBudget").value;
+  const res = await post(
+    `/api/campaign/add?name=${encodeURIComponent(name)}&bid=${bid}&qualityA=${qa}&qualityB=${qb}&budget=${budget}`);
+  if (res.error) {
+    toast(res.error, true);
+    return;
+  }
+  document.getElementById("addName").value = "";
+  toast("Campaign added — search again to see it compete.");
+  refresh();
+});
+
+refresh();
+setInterval(refresh, 2500);
+</script>
+</body>
+</html>

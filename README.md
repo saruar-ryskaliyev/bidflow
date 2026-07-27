@@ -23,6 +23,7 @@ around. See [the hard problem](#the-hard-problem-distributed-budget-enforcement)
 | `auction-core` — GSP ranking and pricing | Implemented, 30 tests green |
 | `sim` — deterministic simulation harness | Implemented, 31 tests green |
 | `budget` — distributed budget enforcement | Leases and reclaim implemented, 45 tests green |
+| `demo` — browser demo of auction + budget | Implemented, 6 tests green, `./gradlew :demo:run` |
 | Pacing controller | Next |
 | Idempotent spend ledger | Not started |
 | gRPC serving layer | Not started |
@@ -305,7 +306,14 @@ Requires JDK 25. The Gradle wrapper handles the rest.
 ```bash
 ./gradlew build          # compile and test everything
 ./gradlew :auction-core:test
+./gradlew :demo:run      # interactive demo at http://localhost:8080
 ```
+
+The demo serves a page where two users with different quality scores search the same
+market: the real engine prices each page, clicks charge real leases, and campaigns drop
+out as budgets exhaust. It runs in one process on one clock, so the skew and partition
+behaviour quantified above is deliberately absent — that part lives in the simulation
+tests, where it can be reproduced by seed.
 
 ## Roadmap
 
