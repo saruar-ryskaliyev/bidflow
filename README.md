@@ -88,6 +88,11 @@ against `System.nanoTime()` and real threads.
 
 ## Results
 
+Both experiments drive spend through the real auction: every simulated request pits the
+budget-enforced campaign against seeded competitors, and what the wallet reserves is the
+GSP price the engine actually cleared. Losing the auction spends nothing, exactly as in
+production.
+
 ### The safety theorem
 
 **Overspend can never exceed what the authority reclaimed unilaterally.**
@@ -109,14 +114,14 @@ reclaim. Twelve seeds per row.
 
 | Reclaim margin | Spent | Overspend | Reclaimed |
 | --- | --- | --- | --- |
-| 0 ms | 113.78% | 13.78% | 146.16% |
-| 50 ms | 113.78% | 13.78% | 122.06% |
-| 100 ms | 111.37% | 11.37% | 97.05% |
-| 150 ms | 100.00% | **0.00%** | 0.00% |
-| 300 ms | 100.00% | **0.00%** | 0.00% |
+| 0 ms | 136.04% | 36.04% | 137.25% |
+| 50 ms | 136.04% | 36.04% | 108.58% |
+| 100 ms | 117.52% | 17.52% | 69.47% |
+| 150 ms | 99.99% | **0.00%** | 0.00% |
+| 300 ms | 99.99% | **0.00%** | 0.00% |
 
 An impatient authority takes leases back from shards that are still spending on them, and the
-overspend is severe — 13.8% of budget, and a reclaim total larger than the budget itself because
+overspend is severe — 36% of budget, and a reclaim total larger than the budget itself because
 the same money churns repeatedly. Once the margin covers the skew it collapses to exactly zero.
 
 The crossing is not quite at 150 ms, though. It sits somewhat below, because shards renew shortly
@@ -132,30 +137,30 @@ Twelve seeds per row.
 
 | Configuration | Delivered | Overspend | Reclaimed |
 | --- | --- | --- | --- |
-| No expiry (the previous design) | 50.83% | **0.00%** | 0.00% |
-| Expiry, never reclaim | 46.71% | **0.00%** | 0.00% |
-| Expiry + reclaim, 500 ms margin | 54.85% | 0.081% | 95.97% |
-| Expiry + reclaim, 200 ms margin | 56.60% | 0.108% | 143.72% |
-| Expiry + reclaim, 100 ms margin | 57.68% | 0.108% | 172.62% |
-| Expiry + reclaim, 50 ms margin | 58.45% | 0.108% | 252.48% |
-| Expiry + reclaim, 0 ms margin | 60.16% | 0.807% | 427.32% |
+| No expiry (the previous design) | 53.57% | **0.00%** | 0.00% |
+| Expiry, never reclaim | 49.64% | **0.00%** | 0.00% |
+| Expiry + reclaim, 500 ms margin | 59.91% | 0.095% | 93.63% |
+| Expiry + reclaim, 200 ms margin | 62.09% | 0.207% | 140.65% |
+| Expiry + reclaim, 100 ms margin | 63.49% | 0.247% | 164.82% |
+| Expiry + reclaim, 50 ms margin | 64.30% | 0.247% | 246.53% |
+| Expiry + reclaim, 0 ms margin | 66.79% | 1.123% | 433.23% |
 
 Three findings.
 
-**Expiry on its own is a regression.** 46.71% against 50.83% for never expiring at all. A lease
+**Expiry on its own is a regression.** 49.64% against 53.57% for never expiring at all. A lease
 that lapses unspent is wasted twice — the holder may no longer spend it and the authority still
 does not take it back. Expiry is not a feature, it is an enabler, and it only pays off paired with
 reclaim.
 
-**The pair is a real improvement, and the price is explicit.** Against the 50.83% baseline,
-a 500 ms margin buys four points of delivery for 0.08% overspend; a zero margin buys nine points
-for 0.8%. Which of those is correct is a business question about whether unbilled delivery costs
-more than undelivered budget, not an engineering one — and the point of the curve is that the
-question can now be answered with numbers instead of intuition.
+**The pair is a real improvement, and the price is explicit.** Against the 53.57% baseline,
+a 500 ms margin buys six points of delivery for 0.095% overspend; a zero margin buys thirteen
+points for 1.1%. Which of those is correct is a business question about whether unbilled delivery
+costs more than undelivered budget, not an engineering one — and the point of the curve is that
+the question can now be answered with numbers instead of intuition.
 
-**Diminishing returns are sharp.** Delivery moves 5.3 points across the whole margin range while
-reclaim churn quadruples. Most of the recoverable money comes back with a patient margin; the
-aggressive settings buy little and risk an order of magnitude more.
+**Diminishing returns are sharp.** Delivery moves 6.9 points across the whole margin range while
+reclaim churn more than quadruples. Most of the recoverable money comes back with a patient
+margin; the aggressive settings buy little and risk an order of magnitude more.
 
 The comparison against "no expiry" is measured under the identical fault mix rather than quoted
 from an earlier run. An improvement demonstrated against a differently-configured baseline would
@@ -163,11 +168,11 @@ not be an improvement.
 
 ### Known inefficiencies, not yet addressed
 
-Delivery peaks around 60%, so most of the shortfall is still unexplained by reclaim alone. Three
+Delivery peaks around 67%, so most of the shortfall is still unexplained by reclaim alone. Three
 candidates are visible in the design and none has been fixed: a shard whose reply is slow will ask
 again on its cooldown and accumulate leases it did not need; sealing before renewal costs one
 round trip per lease during which the shard spends nothing; and a shard holding less than the
-cheapest request cannot spend its remainder.
+price of a click cannot spend its remainder.
 
 ## The mechanism
 
@@ -340,21 +345,20 @@ tests, where it can be reproduced by seed.
 ## Roadmap
 
 Done: the auction, the simulator, lease-based budget enforcement, unilateral reclaim, the two
-experiments quantifying what reclaim costs and returns, and the JMH microbenchmarks that turned
-the latency and allocation design goals into measurements.
+experiments quantifying what reclaim costs and returns — with spend priced by the real auction
+inside them — and the JMH microbenchmarks that turned the latency and allocation design goals
+into measurements.
 
-1. **Close the rest of the delivery gap** — 60% is still not good enough, and the three suspected
+1. **Close the rest of the delivery gap** — 67% is still not good enough, and the three suspected
    causes above are all measurable. Fixing the request stampede and the renewal gap should be
    worth more than any further tuning of the reclaim margin.
 2. **Pacing controller** — spend the budget smoothly across a day of varying traffic rather than
    exhausting it by mid-morning, built on the lease mechanism rather than beside it.
-3. **Wire in the auction** — replace the harness's synthetic per-request cost with a real
-   `auction-core` auction, so spend is driven by prices the auction actually cleared.
-4. **Simulation explorer** — a static site, generated by CI from a real run, replaying a
+3. **Simulation explorer** — a static site, generated by CI from a real run, replaying a
    simulated day and letting the trade-off curve be explored rather than read.
-5. **Spend ledger** — write-ahead log with periodic snapshots and idempotency keys, so a retried
+4. **Spend ledger** — write-ahead log with periodic snapshots and idempotency keys, so a retried
    click is charged exactly once.
-6. **gRPC serving** — deadline propagation and load shedding, because a late ad response is worth
+5. **gRPC serving** — deadline propagation and load shedding, because a late ad response is worth
    nothing and shedding beats queueing.
-7. **Load harness** — HDR histogram percentiles recorded free of coordinated omission, plus a
+6. **Load harness** — HDR histogram percentiles recorded free of coordinated omission, plus a
    ZGC-versus-G1 comparison under sustained load.

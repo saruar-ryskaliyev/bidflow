@@ -9,6 +9,9 @@ dependencies {
     // is driven, which is what allows the same classes to run under simulation and under a
     // real network without a behavioural difference between them.
     testImplementation(project(":sim"))
+    // The auction prices the simulated traffic, so spend in the experiments is driven by
+    // prices the engine actually cleared rather than by a synthetic cost draw.
+    testImplementation(project(":auction-core"))
 }
 
 tasks.test {

@@ -1,5 +1,8 @@
 package io.bidflow.budget;
 
+import io.bidflow.auction.AuctionEngine;
+import io.bidflow.auction.AuctionOutcome;
+import io.bidflow.auction.AuctionRequest;
 import io.bidflow.sim.NetworkConditions;
 import io.bidflow.sim.NodeClock;
 import io.bidflow.sim.SimNetwork;
@@ -8,6 +11,11 @@ import io.bidflow.sim.Simulation;
 /**
  * A whole budget-enforcement deployment inside the simulator: one authority, many serving
  * shards, traffic trying to spend money, and faults free to interrupt any of it.
+ *
+ * <p>Spend is priced by a real {@code auction-core} auction rather than a synthetic cost
+ * draw: each request pits the budget-enforced campaign against seeded competitors, and
+ * what the wallet is asked to reserve is the GSP price the engine actually cleared. Losing
+ * the auction spends nothing, which is also true in production.
  *
  * <p>The authority is node 0 and shard {@code s} is node {@code s + 1}, so the simulator's crash
  * and partition controls address them directly.
@@ -45,10 +53,22 @@ final class BudgetCluster {
         long reportIntervalNanos = 50 * MILLIS;
         long sweepIntervalNanos = 25 * MILLIS;
 
-        long minCostMicros = 100L;
-        long maxCostMicros = 900L;
         long minRequestIntervalNanos = 500_000L;
         long maxRequestIntervalNanos = 1_500_000L;
+
+        /** The auction each request runs. Our campaign competes against seeded rivals. */
+        int slots = 3;
+
+        /** Kept positive so a won slot always carries a positive price. */
+        long reserveMicros = 100L;
+
+        int competitorCount = 6;
+        long minCompetitorBidMicros = 100L;
+        long maxCompetitorBidMicros = 1_000L;
+        int minCompetitorQualityBps = 2_000;
+        int maxCompetitorQualityBps = 10_000;
+        long ourBidMicros = 800L;
+        int ourQualityBps = 8_000;
 
         Config shardCount(int value) {
             shardCount = value;
@@ -81,6 +101,11 @@ final class BudgetCluster {
         }
     }
 
+    /** The campaign whose budget is enforced; competitors carry ids from 100 upward. */
+    private static final long OUR_CAMPAIGN_ID = 1L;
+
+    private static final long COMPETITOR_ID_BASE = 100L;
+
     private final Simulation sim;
     private final SimNetwork net;
     private final Config config;
@@ -91,10 +116,14 @@ final class BudgetCluster {
     private final long[] incarnations;
     private final long[] nextRequestAllowedAt;
     private final long[] nextReportAt;
+    private final AuctionEngine[] engines;
+    private final AuctionRequest[] requests;
+    private final AuctionOutcome[] outcomes;
 
     private long actualSpendMicros;
     private long servedRequests;
     private long refusedRequests;
+    private long lostAuctions;
     private long restarts;
 
     BudgetCluster(Simulation sim, Config config, NetworkConditions conditions) {
@@ -117,11 +146,19 @@ final class BudgetCluster {
         this.incarnations = new long[config.shardCount];
         this.nextRequestAllowedAt = new long[config.shardCount];
         this.nextReportAt = new long[config.shardCount];
+        this.engines = new AuctionEngine[config.shardCount];
+        this.requests = new AuctionRequest[config.shardCount];
+        this.outcomes = new AuctionOutcome[config.shardCount];
 
         for (int shard = 0; shard < config.shardCount; shard++) {
             incarnations[shard] = 1L;
             wallets[shard] = new SpendAuthority(shard, 1L);
             clocks[shard] = new NodeClock(sim, clockOffsetsNanos[shard]);
+            // One engine per shard, mirroring the thread-confined deployment shape even
+            // though the simulation itself is single-threaded.
+            engines[shard] = new AuctionEngine(config.competitorCount + 1);
+            requests[shard] = new AuctionRequest(config.competitorCount + 1);
+            outcomes[shard] = new AuctionOutcome(config.slots);
         }
     }
 
@@ -168,15 +205,54 @@ final class BudgetCluster {
         });
     }
 
+    /**
+     * One request on one shard: a real auction decides whether our campaign wins a slot
+     * and what a click costs, then the wallet decides whether it can afford that price.
+     *
+     * <p>Competitor bids and qualities are drawn fresh per request, and the draws happen
+     * unconditionally so the random stream never depends on wallet state — the same
+     * discipline {@link io.bidflow.sim.SimNetwork} applies to its own draws. Our campaign
+     * always enters the auction; running out of budget shows up as {@code tryReserve}
+     * refusing the cleared price, not as absence from the candidate set, so refusals mean
+     * the same thing they meant under the synthetic-cost harness.
+     */
     private void serveOne(int shard, long now) {
-        final long span = config.maxCostMicros - config.minCostMicros;
-        final long cost = config.minCostMicros + (span == 0 ? 0 : sim.random().nextLong(span + 1));
+        final AuctionRequest request = requests[shard].reset(config.slots, config.reserveMicros);
+        for (int i = 0; i < config.competitorCount; i++) {
+            final long bid = draw(config.minCompetitorBidMicros, config.maxCompetitorBidMicros);
+            final int quality = (int) draw(config.minCompetitorQualityBps, config.maxCompetitorQualityBps);
+            request.add(COMPETITOR_ID_BASE + i, bid, quality);
+        }
+        request.add(OUR_CAMPAIGN_ID, config.ourBidMicros, config.ourQualityBps);
+        engines[shard].run(request, outcomes[shard]);
+
+        final long cost = ourPriceMicros(outcomes[shard]);
+        if (cost == 0) {
+            lostAuctions++;
+            return;
+        }
         if (wallets[shard].tryReserve(now, cost)) {
             actualSpendMicros += cost;
             servedRequests++;
         } else {
             refusedRequests++;
         }
+    }
+
+    /** The price our campaign owes for its slot, or 0 when it was outranked entirely. */
+    private static long ourPriceMicros(AuctionOutcome outcome) {
+        for (int k = 0; k < outcome.size(); k++) {
+            if (outcome.campaignId(k) == OUR_CAMPAIGN_ID) {
+                // Never zero for a winner: the positive reserve puts a floor under it.
+                return outcome.priceMicros(k);
+            }
+        }
+        return 0L;
+    }
+
+    private long draw(long minInclusive, long maxInclusive) {
+        final long span = maxInclusive - minInclusive;
+        return minInclusive + (span == 0 ? 0 : sim.random().nextLong(span + 1));
     }
 
     /**
@@ -281,6 +357,11 @@ final class BudgetCluster {
 
     long refusedRequests() {
         return refusedRequests;
+    }
+
+    /** Requests where our campaign was outranked outright, so there was nothing to spend. */
+    long lostAuctions() {
+        return lostAuctions;
     }
 
     long restarts() {
