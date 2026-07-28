@@ -4,18 +4,9 @@ plugins {
 
 description = "Distributed budget enforcement: a central authority granting spend authority to serving shards."
 
-dependencies {
-    // The simulator is a test dependency only. Production code knows nothing about how it
-    // is driven, which is what allows the same classes to run under simulation and under a
-    // real network without a behavioural difference between them.
-    testImplementation(project(":sim"))
-    // The auction prices the simulated traffic, so spend in the experiments is driven by
-    // prices the engine actually cleared rather than by a synthetic cost draw.
-    testImplementation(project(":auction-core"))
-}
+// Multi-shard simulation experiments live in :budget-sim. Production budget code stays
+// free of the simulator so the same classes can run under sim and under real serving.
 
 tasks.test {
-    // The fault-injection sweep reports what it exercised. A green run that proves nothing
-    // is indistinguishable from a green run that proves everything unless it says so.
-    testLogging.showStandardStreams = true
+    // Keep stdout from unit tests quiet unless a suite opts in.
 }

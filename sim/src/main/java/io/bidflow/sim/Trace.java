@@ -83,6 +83,29 @@ public final class Trace {
         return Collections.unmodifiableList(entries);
     }
 
+    /** Number of retained entries (after any truncation at the limit). */
+    public int size() {
+        return entries.size();
+    }
+
+    /** Retained entry at {@code index}, in the order recorded. */
+    public Entry entryAt(int index) {
+        return entries.get(index);
+    }
+
+    /**
+     * Retained entries from {@code index} inclusive to the end.
+     *
+     * @throws IndexOutOfBoundsException if {@code index} is outside {@code [0, size()]}
+     */
+    public List<Entry> entriesFrom(int index) {
+        if (index < 0 || index > entries.size()) {
+            throw new IndexOutOfBoundsException(
+                    "index " + index + " is outside [0, " + entries.size() + "]");
+        }
+        return Collections.unmodifiableList(entries.subList(index, entries.size()));
+    }
+
     /** Total events offered, including any dropped once {@link #DEFAULT_LIMIT} was hit. */
     public long recordedCount() {
         return recorded;

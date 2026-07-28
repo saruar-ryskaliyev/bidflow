@@ -1,9 +1,13 @@
-package io.bidflow.budget;
+package io.bidflow.budget.sim;
 
 import io.bidflow.auction.AuctionEngine;
 import io.bidflow.auction.AuctionOutcome;
 import io.bidflow.auction.AuctionRequest;
+import io.bidflow.budget.BudgetAuthority;
+import io.bidflow.budget.Lease;
+import io.bidflow.budget.SpendAuthority;
 import io.bidflow.sim.NetworkConditions;
+import io.bidflow.sim.NetworkObserver;
 import io.bidflow.sim.NodeClock;
 import io.bidflow.sim.SimNetwork;
 import io.bidflow.sim.Simulation;
@@ -31,115 +35,9 @@ import java.util.List;
  * the measurement came out of the components under test, a bug that corrupted the accounting
  * would also corrupt the measurement, and the test would pass while the money went missing.
  */
-final class BudgetCluster {
+public final class BudgetCluster {
 
-    static final int AUTHORITY_NODE = 0;
-    private static final long MILLIS = 1_000_000L;
-
-    /** Mutable and fluent, because the sweep varies several of these per run. */
-    static final class Config {
-        int shardCount = 8;
-        long budgetMicros = 10_000_000L;
-
-        /** Face value requested per lease. Also the cap on what one lost lease can cost. */
-        long leaseMicros = 200_000L;
-
-        long leaseDurationNanos = 200 * MILLIS;
-        long reclaimMarginNanos = BudgetAuthority.NEVER_RECLAIM;
-
-        /** Renew once the wallet drops this low, or this long before the lease expires. */
-        long lowWaterMicros = 40_000L;
-        long renewAheadNanos = 20 * MILLIS;
-
-        long requestCooldownNanos = 25 * MILLIS;
-        long reportIntervalNanos = 50 * MILLIS;
-        long sweepIntervalNanos = 25 * MILLIS;
-
-        long minRequestIntervalNanos = 500_000L;
-        long maxRequestIntervalNanos = 1_500_000L;
-
-        /**
-         * When true, early traffic is denser than late traffic — the shape pacing exists to
-         * smooth out. The first half of the run draws from the short end of the interval
-         * range; the second half draws from the long end.
-         */
-        boolean frontLoadedTraffic = false;
-
-        /** Optional pacing; null keeps the historical unpaced grant behaviour. */
-        LeaseGrantPolicy grantPolicy = null;
-
-        /** How often to snapshot cumulative spend for pacing curve checks; 0 disables. */
-        long checkpointIntervalNanos = 0L;
-
-        /** The auction each request runs. Our campaign competes against seeded rivals. */
-        int slots = 3;
-
-        /** Kept positive so a won slot always carries a positive price. */
-        long reserveMicros = 100L;
-
-        int competitorCount = 6;
-        long minCompetitorBidMicros = 100L;
-        long maxCompetitorBidMicros = 1_000L;
-        int minCompetitorQualityBps = 2_000;
-        int maxCompetitorQualityBps = 10_000;
-        long ourBidMicros = 800L;
-        int ourQualityBps = 8_000;
-
-        Config shardCount(int value) {
-            shardCount = value;
-            return this;
-        }
-
-        Config budgetMicros(long value) {
-            budgetMicros = value;
-            return this;
-        }
-
-        Config leaseMicros(long value) {
-            leaseMicros = value;
-            return this;
-        }
-
-        Config leaseDurationNanos(long value) {
-            leaseDurationNanos = value;
-            return this;
-        }
-
-        Config reclaimMarginNanos(long value) {
-            reclaimMarginNanos = value;
-            return this;
-        }
-
-        Config lowWaterMicros(long value) {
-            lowWaterMicros = value;
-            return this;
-        }
-
-        Config frontLoadedTraffic(boolean value) {
-            frontLoadedTraffic = value;
-            return this;
-        }
-
-        Config grantPolicy(LeaseGrantPolicy value) {
-            grantPolicy = value;
-            return this;
-        }
-
-        Config checkpointIntervalNanos(long value) {
-            checkpointIntervalNanos = value;
-            return this;
-        }
-
-        Config minRequestIntervalNanos(long value) {
-            minRequestIntervalNanos = value;
-            return this;
-        }
-
-        Config maxRequestIntervalNanos(long value) {
-            maxRequestIntervalNanos = value;
-            return this;
-        }
-    }
+    public static final int AUTHORITY_NODE = 0;
 
     /** The campaign whose budget is enforced; competitors carry ids from 100 upward. */
     private static final long OUR_CAMPAIGN_ID = 1L;
@@ -148,11 +46,13 @@ final class BudgetCluster {
 
     private final Simulation sim;
     private final SimNetwork net;
-    private final Config config;
+    private final BudgetClusterConfig config;
     private final BudgetAuthority authority;
     private final NodeClock authorityClock;
     private final SpendAuthority[] wallets;
     private final NodeClock[] clocks;
+    private final long[] clockOffsetsNanos;
+    private final boolean[] alive;
     private final long[] incarnations;
     private final long[] nextRequestAllowedAt;
     private final long[] nextReportAt;
@@ -162,6 +62,8 @@ final class BudgetCluster {
 
     /** The cheapest price a won slot can carry; below this a wallet cannot spend at all. */
     private final long minPriceFloorMicros;
+
+    private boolean trafficEnabled = true;
 
     private long actualSpendMicros;
     private long servedRequests;
@@ -173,18 +75,32 @@ final class BudgetCluster {
     private final List<long[]> spendCheckpoints = new ArrayList<>();
     private long runHorizonNanos;
 
-    BudgetCluster(Simulation sim, Config config, NetworkConditions conditions) {
-        this(sim, config, conditions, new long[config.shardCount]);
+    public BudgetCluster(
+            Simulation sim, BudgetClusterConfig config, NetworkConditions conditions) {
+        this(sim, config, conditions, new long[config.shardCount()]);
     }
 
-    BudgetCluster(Simulation sim, Config config, NetworkConditions conditions, long[] clockOffsetsNanos) {
+    public BudgetCluster(
+            Simulation sim,
+            BudgetClusterConfig config,
+            NetworkConditions conditions,
+            long[] clockOffsetsNanos) {
+        this(sim, config, conditions, clockOffsetsNanos, NetworkObserver.noop());
+    }
+
+    public BudgetCluster(
+            Simulation sim,
+            BudgetClusterConfig config,
+            NetworkConditions conditions,
+            long[] clockOffsetsNanos,
+            NetworkObserver observer) {
         if (clockOffsetsNanos.length != config.shardCount) {
             throw new IllegalArgumentException(
                     "expected " + config.shardCount + " clock offsets, got " + clockOffsetsNanos.length);
         }
         this.sim = sim;
         this.config = config;
-        this.net = new SimNetwork(sim, config.shardCount + 1, conditions);
+        this.net = new SimNetwork(sim, config.shardCount + 1, conditions, observer);
         this.authority = config.grantPolicy == null
                 ? new BudgetAuthority(
                         config.budgetMicros, config.shardCount, config.leaseDurationNanos,
@@ -195,6 +111,8 @@ final class BudgetCluster {
         this.authorityClock = new NodeClock(sim, 0L);
         this.wallets = new SpendAuthority[config.shardCount];
         this.clocks = new NodeClock[config.shardCount];
+        this.clockOffsetsNanos = clockOffsetsNanos.clone();
+        this.alive = new boolean[config.shardCount];
         this.incarnations = new long[config.shardCount];
         this.nextRequestAllowedAt = new long[config.shardCount];
         this.nextReportAt = new long[config.shardCount];
@@ -205,6 +123,7 @@ final class BudgetCluster {
                 config.reserveMicros * AuctionRequest.QUALITY_ONE_BPS, config.ourQualityBps);
 
         for (int shard = 0; shard < config.shardCount; shard++) {
+            alive[shard] = true;
             incarnations[shard] = 1L;
             wallets[shard] = new SpendAuthority(shard, 1L);
             clocks[shard] = new NodeClock(sim, clockOffsetsNanos[shard]);
@@ -216,7 +135,11 @@ final class BudgetCluster {
         }
     }
 
-    void start() {
+    public static int nodeOf(int shard) {
+        return shard + 1;
+    }
+
+    public void start() {
         for (int shard = 0; shard < config.shardCount; shard++) {
             scheduleTraffic(shard);
         }
@@ -227,12 +150,191 @@ final class BudgetCluster {
      * Starts traffic and, when configured, spend checkpoints over a known horizon so a pacing
      * test can compare cumulative delivery against the target curve.
      */
-    void start(long runHorizonNanos) {
+    public void start(long runHorizonNanos) {
         this.runHorizonNanos = runHorizonNanos;
         start();
         if (config.checkpointIntervalNanos > 0) {
             scheduleCheckpoint(config.checkpointIntervalNanos);
         }
+    }
+
+    /** When false, in-flight traffic ticks finish but do not re-arm. */
+    public void setTrafficEnabled(boolean enabled) {
+        trafficEnabled = enabled;
+        if (enabled) {
+            for (int shard = 0; shard < config.shardCount; shard++) {
+                if (alive[shard]) {
+                    scheduleTraffic(shard);
+                }
+            }
+        }
+    }
+
+    /**
+     * Runs one search on a shard without re-arming background traffic.
+     *
+     * <p>Renewal and reporting still run so lease protocol behaviour matches production traffic.
+     */
+    public SearchResult injectSearch(int shard) {
+        checkShard(shard);
+        final long now = clocks[shard].nanos();
+        final SearchResult result = serveOne(shard, now);
+        maybeRenew(shard, now);
+        maybeReport(shard, now);
+        return result;
+    }
+
+    /**
+     * Kills a shard's timers without starting a replacement.
+     *
+     * <p>Background traffic on the shard stops re-arming until {@link #restartShard(int)}.
+     */
+    public void crashShard(int shard) {
+        checkShard(shard);
+        sim.crash(nodeOf(shard));
+        alive[shard] = false;
+    }
+
+    /**
+     * Kills a shard's process and starts a replacement.
+     *
+     * <p>The wallet is discarded rather than carried over, because it lived in memory. The
+     * replacement therefore has no authority and no record of what its predecessor spent.
+     */
+    public void restartShard(int shard) {
+        checkShard(shard);
+        sim.crash(nodeOf(shard));
+        alive[shard] = true;
+        incarnations[shard]++;
+        wallets[shard] = new SpendAuthority(shard, incarnations[shard]);
+        nextRequestAllowedAt[shard] = 0L;
+        nextReportAt[shard] = 0L;
+        restarts++;
+        if (trafficEnabled) {
+            scheduleTraffic(shard);
+        }
+    }
+
+    public SimNetwork network() {
+        return net;
+    }
+
+    public BudgetAuthority authority() {
+        return authority;
+    }
+
+    public BudgetClusterConfig config() {
+        return config;
+    }
+
+    public SpendAuthority wallet(int shard) {
+        checkShard(shard);
+        return wallets[shard];
+    }
+
+    public NodeClock shardClock(int shard) {
+        checkShard(shard);
+        return clocks[shard];
+    }
+
+    public NodeClock authorityClock() {
+        return authorityClock;
+    }
+
+    public boolean isShardAlive(int shard) {
+        checkShard(shard);
+        return alive[shard];
+    }
+
+    /** Ground truth: money actually committed, tallied by the harness. */
+    public long actualSpendMicros() {
+        return actualSpendMicros;
+    }
+
+    public long overspendMicros() {
+        return Math.max(0L, actualSpendMicros - config.budgetMicros);
+    }
+
+    public double deliveredFraction() {
+        return (double) actualSpendMicros / config.budgetMicros;
+    }
+
+    public double overspendFraction() {
+        return (double) overspendMicros() / config.budgetMicros;
+    }
+
+    public long servedRequests() {
+        return servedRequests;
+    }
+
+    public long refusedRequests() {
+        return refusedRequests;
+    }
+
+    /** Requests where our campaign was outranked outright, so there was nothing to spend. */
+    public long lostAuctions() {
+        return lostAuctions;
+    }
+
+    public long restarts() {
+        return restarts;
+    }
+
+    /** Snapshots of {@code [simNanos, actualSpendMicros]} when checkpointing is enabled. */
+    public List<long[]> spendCheckpoints() {
+        return spendCheckpoints;
+    }
+
+    public ClusterSnapshot snapshot() {
+        final List<ShardSnapshot> shards = new ArrayList<>(config.shardCount);
+        for (int shard = 0; shard < config.shardCount; shard++) {
+            final SpendAuthority wallet = wallets[shard];
+            shards.add(new ShardSnapshot(
+                    shard,
+                    alive[shard],
+                    wallet.incarnation(),
+                    wallet.remainingMicros(),
+                    wallet.leaseId(),
+                    wallet.leaseSpentMicros(),
+                    wallet.lifetimeSpentMicros(),
+                    wallet.leaseExpiresAtNanos(),
+                    clockOffsetsNanos[shard],
+                    wallet.pendingReleaseId()));
+        }
+
+        final int nodes = net.nodeCount();
+        final List<ClusterSnapshot.BlockedLink> blocked = new ArrayList<>();
+        for (int from = 0; from < nodes; from++) {
+            for (int to = 0; to < nodes; to++) {
+                if (net.isBlocked(from, to)) {
+                    blocked.add(new ClusterSnapshot.BlockedLink(from, to));
+                }
+            }
+        }
+
+        final long spendableRemainder = Math.max(0L, config.budgetMicros - actualSpendMicros);
+        return new ClusterSnapshot(
+                config.budgetMicros,
+                authority.settledMicros(),
+                authority.outstandingMicros(),
+                authority.headroomMicros(),
+                authority.observedSpendMicros(),
+                actualSpendMicros,
+                overspendMicros(),
+                spendableRemainder,
+                List.copyOf(shards),
+                net.sentCount(),
+                net.deliveredCount(),
+                net.droppedCount(),
+                net.duplicatedCount(),
+                net.partitionedCount(),
+                servedRequests,
+                refusedRequests,
+                lostAuctions,
+                restarts,
+                List.copyOf(blocked),
+                sim.now(),
+                sim.eventsFired());
     }
 
     private void scheduleCheckpoint(long atNanos) {
@@ -249,22 +351,6 @@ final class BudgetCluster {
         });
     }
 
-    /**
-     * Kills a shard's process and starts a replacement.
-     *
-     * <p>The wallet is discarded rather than carried over, because it lived in memory. The
-     * replacement therefore has no authority and no record of what its predecessor spent.
-     */
-    void restartShard(int shard) {
-        sim.crash(nodeOf(shard));
-        incarnations[shard]++;
-        wallets[shard] = new SpendAuthority(shard, incarnations[shard]);
-        nextRequestAllowedAt[shard] = 0L;
-        nextReportAt[shard] = 0L;
-        restarts++;
-        scheduleTraffic(shard);
-    }
-
     /** The authority's expiry sweeper, the only place unilateral reclaim happens. */
     private void scheduleSweep() {
         sim.schedule(config.sweepIntervalNanos, AUTHORITY_NODE, () -> {
@@ -274,13 +360,21 @@ final class BudgetCluster {
     }
 
     private void scheduleTraffic(int shard) {
+        if (!trafficEnabled || !alive[shard]) {
+            return;
+        }
         final long delay = nextRequestDelay();
         sim.schedule(delay, nodeOf(shard), () -> {
+            if (!alive[shard]) {
+                return;
+            }
             final long now = clocks[shard].nanos();
             serveOne(shard, now);
             maybeRenew(shard, now);
             maybeReport(shard, now);
-            scheduleTraffic(shard);
+            if (trafficEnabled && alive[shard]) {
+                scheduleTraffic(shard);
+            }
         });
     }
 
@@ -312,7 +406,7 @@ final class BudgetCluster {
      * refusing the cleared price, not as absence from the candidate set, so refusals mean
      * the same thing they meant under the synthetic-cost harness.
      */
-    private void serveOne(int shard, long now) {
+    private SearchResult serveOne(int shard, long now) {
         final AuctionRequest request = requests[shard].reset(config.slots, config.reserveMicros);
         for (int i = 0; i < config.competitorCount; i++) {
             final long bid = draw(config.minCompetitorBidMicros, config.maxCompetitorBidMicros);
@@ -325,14 +419,15 @@ final class BudgetCluster {
         final long cost = ourPriceMicros(outcomes[shard]);
         if (cost == 0) {
             lostAuctions++;
-            return;
+            return new SearchResult(false, false, false, 0L);
         }
         if (wallets[shard].tryReserve(now, cost)) {
             actualSpendMicros += cost;
             servedRequests++;
-        } else {
-            refusedRequests++;
+            return new SearchResult(true, true, false, cost);
         }
+        refusedRequests++;
+        return new SearchResult(true, false, true, cost);
     }
 
     /** The price our campaign owes for its slot, or 0 when it was outranked entirely. */
@@ -456,58 +551,10 @@ final class BudgetCluster {
                 authority.recordReport(shard, incarnation, leaseId, spent));
     }
 
-    static int nodeOf(int shard) {
-        return shard + 1;
-    }
-
-    SimNetwork network() {
-        return net;
-    }
-
-    BudgetAuthority authority() {
-        return authority;
-    }
-
-    Config config() {
-        return config;
-    }
-
-    /** Ground truth: money actually committed, tallied by the harness. */
-    long actualSpendMicros() {
-        return actualSpendMicros;
-    }
-
-    long overspendMicros() {
-        return Math.max(0L, actualSpendMicros - config.budgetMicros);
-    }
-
-    double deliveredFraction() {
-        return (double) actualSpendMicros / config.budgetMicros;
-    }
-
-    double overspendFraction() {
-        return (double) overspendMicros() / config.budgetMicros;
-    }
-
-    long servedRequests() {
-        return servedRequests;
-    }
-
-    long refusedRequests() {
-        return refusedRequests;
-    }
-
-    /** Requests where our campaign was outranked outright, so there was nothing to spend. */
-    long lostAuctions() {
-        return lostAuctions;
-    }
-
-    long restarts() {
-        return restarts;
-    }
-
-    /** Snapshots of {@code [simNanos, actualSpendMicros]} when checkpointing is enabled. */
-    List<long[]> spendCheckpoints() {
-        return spendCheckpoints;
+    private void checkShard(int shard) {
+        if (shard < 0 || shard >= config.shardCount) {
+            throw new IllegalArgumentException(
+                    "shard must be in [0, " + config.shardCount + "), was " + shard);
+        }
     }
 }

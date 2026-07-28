@@ -194,4 +194,85 @@ class SimNetworkTest {
         assertThat(net.droppedCount()).isZero();
         assertThat(net.duplicatedCount()).isZero();
     }
+
+    @Test
+    @DisplayName("an observer sees send, deliver, drop, block, partition, and heal")
+    void observerSeesNetworkLifecycle() {
+        final Simulation sim = new Simulation(1L, Trace.disabled());
+        final List<NetworkEvent> events = new ArrayList<>();
+        final SimNetwork net = new SimNetwork(sim, 2, NetworkConditions.perfect(), events::add);
+
+        net.partition(0, 1);
+        net.send(0, 1, "blocked-msg", () -> {});
+        net.heal(0, 1);
+        net.send(0, 1, "ok", () -> {});
+        sim.run();
+
+        assertThat(events)
+                .extracting(NetworkEvent::kind)
+                .containsExactly(
+                        NetworkEvent.Kind.PARTITION,
+                        NetworkEvent.Kind.PARTITION,
+                        NetworkEvent.Kind.SEND,
+                        NetworkEvent.Kind.BLOCK,
+                        NetworkEvent.Kind.HEAL,
+                        NetworkEvent.Kind.SEND,
+                        NetworkEvent.Kind.DELIVER);
+        assertThat(events.get(2).label()).isEqualTo("blocked-msg");
+        assertThat(events.get(6).label()).isEqualTo("ok");
+    }
+
+    @Test
+    @DisplayName("an observer sees drops and duplicates without changing counters")
+    void observerSeesDropsAndDuplicates() {
+        final NetworkConditions lossyDup =
+                new NetworkConditions(MILLIS, MILLIS, 1.0, 0.0);
+        final Simulation dropSim = new Simulation(11L, Trace.disabled());
+        final List<NetworkEvent> dropEvents = new ArrayList<>();
+        final SimNetwork dropNet =
+                new SimNetwork(dropSim, 2, lossyDup, dropEvents::add);
+        dropNet.send(0, 1, "lost", () -> {});
+        dropSim.run();
+        assertThat(dropEvents)
+                .extracting(NetworkEvent::kind)
+                .containsExactly(NetworkEvent.Kind.SEND, NetworkEvent.Kind.DROP);
+
+        final NetworkConditions alwaysDup =
+                new NetworkConditions(MILLIS, MILLIS, 0.0, 1.0);
+        final Simulation dupSim = new Simulation(12L, Trace.disabled());
+        final List<NetworkEvent> dupEvents = new ArrayList<>();
+        final SimNetwork dupNet =
+                new SimNetwork(dupSim, 2, alwaysDup, dupEvents::add);
+        dupNet.send(0, 1, "twice", () -> {});
+        dupSim.run();
+        assertThat(dupEvents)
+                .extracting(NetworkEvent::kind)
+                .containsExactly(
+                        NetworkEvent.Kind.SEND,
+                        NetworkEvent.Kind.DUPLICATE,
+                        NetworkEvent.Kind.DELIVER,
+                        NetworkEvent.Kind.DELIVER);
+        assertThat(dupEvents.get(3).duplicate()).isTrue();
+    }
+
+    @Test
+    @DisplayName("attaching a noop observer does not change a deterministic run")
+    void observerDoesNotPerturbDeterminism() {
+        final String without = observedDigest(NetworkObserver.noop());
+        final String with = observedDigest(event -> {});
+        assertThat(with).isEqualTo(without);
+    }
+
+    private static String observedDigest(NetworkObserver observer) {
+        final Simulation sim = new Simulation(42L, Trace.enabled());
+        final SimNetwork net = new SimNetwork(sim, 3, NetworkConditions.lan(), observer);
+        net.partition(0, 1);
+        for (int i = 0; i < 20; i++) {
+            net.send(0, 2, "m" + i, () -> {});
+            net.send(1, 2, "n" + i, () -> {});
+        }
+        sim.schedule(5 * MILLIS, () -> net.heal(0, 1));
+        sim.runUntil(100 * MILLIS);
+        return sim.trace().digest();
+    }
 }

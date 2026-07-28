@@ -187,4 +187,68 @@ class SimulationTest {
         sim.run();
         assertThat(sim.eventsFired()).isEqualTo(10);
     }
+
+    @Test
+    @DisplayName("step fires one live event at a time in schedule order")
+    void stepFiresOneEventAtATime() {
+        final Simulation sim = new Simulation(1L);
+        final List<String> fired = new ArrayList<>();
+
+        sim.schedule(30 * MILLIS, () -> fired.add("third"));
+        sim.schedule(10 * MILLIS, () -> fired.add("first"));
+        sim.schedule(20 * MILLIS, () -> fired.add("second"));
+
+        assertThat(sim.step()).isTrue();
+        assertThat(fired).containsExactly("first");
+        assertThat(sim.now()).isEqualTo(10 * MILLIS);
+
+        assertThat(sim.step()).isTrue();
+        assertThat(fired).containsExactly("first", "second");
+
+        assertThat(sim.step(10)).isEqualTo(1);
+        assertThat(fired).containsExactly("first", "second", "third");
+        assertThat(sim.step()).isFalse();
+        assertThat(sim.peek()).isEmpty();
+    }
+
+    @Test
+    @DisplayName("peek reports the next live event without firing it")
+    void peekDoesNotFire() {
+        final Simulation sim = new Simulation(1L);
+        final List<String> fired = new ArrayList<>();
+
+        sim.schedule(5 * MILLIS, 3, () -> fired.add("a"));
+        final Simulation.PendingEvent pending = sim.peek().orElseThrow();
+
+        assertThat(pending.timeNanos()).isEqualTo(5 * MILLIS);
+        assertThat(pending.owner()).isEqualTo(3);
+        assertThat(fired).isEmpty();
+        assertThat(sim.eventsFired()).isZero();
+        assertThat(sim.pendingEvents()).isEqualTo(1);
+    }
+
+    @Test
+    @DisplayName("step and peek skip events cancelled by a crash")
+    void stepAndPeekSkipCancelledEvents() {
+        final Simulation sim = new Simulation(1L);
+        final List<String> fired = new ArrayList<>();
+
+        sim.schedule(20 * MILLIS, 1, () -> fired.add("stale"));
+        sim.schedule(30 * MILLIS, 2, () -> fired.add("alive"));
+        sim.crash(1);
+
+        assertThat(sim.peek().orElseThrow().owner()).isEqualTo(2);
+        assertThat(sim.step()).isTrue();
+        assertThat(fired).containsExactly("alive");
+        assertThat(sim.step()).isFalse();
+    }
+
+    @Test
+    @DisplayName("rejects a negative step count")
+    void rejectsNegativeStepCount() {
+        final Simulation sim = new Simulation(1L);
+        assertThatThrownBy(() -> sim.step(-1L))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("count");
+    }
 }

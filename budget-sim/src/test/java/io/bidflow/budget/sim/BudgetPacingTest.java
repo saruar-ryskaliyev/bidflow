@@ -1,7 +1,10 @@
-package io.bidflow.budget;
+package io.bidflow.budget.sim;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import io.bidflow.budget.BudgetAuthority;
+import io.bidflow.budget.LeaseGrantPolicy;
+import io.bidflow.budget.PacingController;
 import io.bidflow.sim.NetworkConditions;
 import io.bidflow.sim.Simulation;
 import io.bidflow.sim.Trace;
@@ -58,7 +61,7 @@ class BudgetPacingTest {
     }
 
     private static BudgetCluster run(LeaseGrantPolicy policy) {
-        final BudgetCluster.Config config = new BudgetCluster.Config()
+        final BudgetClusterConfig config = new BudgetClusterConfig()
                 .shardCount(4)
                 .budgetMicros(BUDGET)
                 .leaseMicros(100_000L)

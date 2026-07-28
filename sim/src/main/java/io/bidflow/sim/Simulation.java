@@ -1,5 +1,6 @@
 package io.bidflow.sim;
 
+import java.util.Optional;
 import java.util.PriorityQueue;
 import java.util.Random;
 import java.util.random.RandomGenerator;
@@ -55,6 +56,15 @@ public final class Simulation {
     public interface Event {
         void fire();
     }
+
+    /**
+     * The next non-cancelled event waiting to fire, without the closure that would run it.
+     *
+     * @param timeNanos simulated instant at which the event fires
+     * @param sequence insertion order among events scheduled at the same instant
+     * @param owner node that owns the event, or {@link #NO_OWNER}
+     */
+    public record PendingEvent(long timeNanos, long sequence, int owner) {}
 
     private final PriorityQueue<Scheduled> pending = new PriorityQueue<>();
     private final Random random;
@@ -165,6 +175,52 @@ public final class Simulation {
         trace.record(now, "crash node=" + owner);
     }
 
+    /**
+     * The next non-cancelled pending event, or empty when the queue has nothing left to do.
+     *
+     * <p>Cancelled events left behind by {@link #crash(int)} are discarded as a side effect
+     * of peeking past them, matching the silent skip that {@link #step()} and
+     * {@link #runUntil(long)} already perform.
+     */
+    public Optional<PendingEvent> peek() {
+        final Scheduled next = nextLive();
+        if (next == null) {
+            return Optional.empty();
+        }
+        return Optional.of(new PendingEvent(next.time(), next.sequence(), next.owner()));
+    }
+
+    /**
+     * Fires the next non-cancelled event.
+     *
+     * @return {@code true} if an event fired, {@code false} if the queue was empty
+     */
+    public boolean step() {
+        final Scheduled next = nextLive();
+        if (next == null) {
+            return false;
+        }
+        pending.poll();
+        fire(next);
+        return true;
+    }
+
+    /**
+     * Fires up to {@code count} non-cancelled events.
+     *
+     * @return how many events actually fired
+     */
+    public long step(long count) {
+        if (count < 0) {
+            throw new IllegalArgumentException("count must not be negative, was " + count);
+        }
+        long fired = 0L;
+        while (fired < count && step()) {
+            fired++;
+        }
+        return fired;
+    }
+
     /** Runs until the queue empties. */
     public void run() {
         runUntil(Long.MAX_VALUE);
@@ -175,22 +231,39 @@ public final class Simulation {
      * at the deadline so that a quiet period still advances time.
      */
     public void runUntil(long deadlineNanos) {
-        while (!pending.isEmpty() && pending.peek().time() <= deadlineNanos) {
-            final Scheduled next = pending.poll();
-            if (isCancelled(next)) {
-                continue;
+        while (true) {
+            final Scheduled next = nextLive();
+            if (next == null || next.time() > deadlineNanos) {
+                break;
             }
-            if (++steps > stepBudget) {
-                throw new IllegalStateException(
-                        "step budget of " + stepBudget + " exhausted at " + next.time()
-                                + "ns; a recurring event is probably re-arming with zero delay");
-            }
-            now = next.time();
-            next.event().fire();
+            pending.poll();
+            fire(next);
         }
         if (deadlineNanos != Long.MAX_VALUE && deadlineNanos > now) {
             now = deadlineNanos;
         }
+    }
+
+    /** Drops cancelled heads until a live event remains, or the queue is empty. */
+    private Scheduled nextLive() {
+        while (!pending.isEmpty()) {
+            final Scheduled head = pending.peek();
+            if (!isCancelled(head)) {
+                return head;
+            }
+            pending.poll();
+        }
+        return null;
+    }
+
+    private void fire(Scheduled next) {
+        if (++steps > stepBudget) {
+            throw new IllegalStateException(
+                    "step budget of " + stepBudget + " exhausted at " + next.time()
+                            + "ns; a recurring event is probably re-arming with zero delay");
+        }
+        now = next.time();
+        next.event().fire();
     }
 
     private boolean isCancelled(Scheduled scheduled) {

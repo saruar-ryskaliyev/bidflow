@@ -10,6 +10,8 @@ dependencyResolutionManagement {
 include("auction-core")
 include("sim")
 include("budget")
+include("budget-sim")
+include("sim-explorer")
 include("demo")
 include("bench")
 include("serving-proto")

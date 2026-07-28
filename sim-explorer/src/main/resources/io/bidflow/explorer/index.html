@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>bidflow</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <header class="top">
+    <div class="brand">
+      <strong>bidflow</strong>
+      <span id="connection-status" class="dot offline" title="Connection">·</span>
+    </div>
+    <div class="transport" aria-label="Simulation clock">
+      <button id="play-toggle" class="btn primary" type="button">Play</button>
+      <select id="speed-select" aria-label="Speed">
+        <option value="1">1×</option>
+        <option value="5">5×</option>
+        <option value="20" selected>20×</option>
+        <option value="100">100×</option>
+      </select>
+      <button id="step-button" class="btn" type="button">Step</button>
+      <button id="advance-button" class="btn" type="button">+10 ms</button>
+      <button id="replay-button" class="btn ghost" type="button">Replay</button>
+    </div>
+    <div class="clock" aria-live="polite">
+      <span id="sim-time">0 ms</span>
+    </div>
+  </header>
+
+  <main>
+    <form id="config-form" class="setup" aria-label="Run setup">
+      <label>Seed <input id="config-seed" name="seed" type="number" value="1" step="1"></label>
+      <label>Shards <input id="config-shards" name="shards" type="number" value="4" min="1" max="32" step="1"></label>
+      <label>Budget <input id="config-budget" name="budget" type="number" value="10000000" min="1" step="1" title="micros"></label>
+      <label>Network
+        <select id="config-network" name="network">
+          <option value="perfect">Perfect</option>
+          <option value="lan" selected>LAN</option>
+          <option value="wan">WAN</option>
+          <option value="hostile">Hostile</option>
+        </select>
+      </label>
+      <label>Skew ms <input id="config-skew" name="skew" type="number" value="0" step="1"></label>
+      <label class="check"><input id="config-traffic" name="traffic" type="checkbox" checked> Traffic</label>
+      <button class="btn" type="submit">Reset</button>
+    </form>
+
+    <section class="balances" aria-label="Budget">
+      <div>
+        <span>Budget</span>
+        <strong data-metric="budget">—</strong>
+      </div>
+      <div>
+        <span>Spent</span>
+        <strong data-metric="actualSpend">—</strong>
+      </div>
+      <div>
+        <span>Left</span>
+        <strong data-metric="spendableRemainder">—</strong>
+      </div>
+      <div id="overspend-row" class="quiet">
+        <span>Overspend</span>
+        <strong data-metric="overspend">—</strong>
+      </div>
+    </section>
+
+    <section class="stage" aria-label="Cluster">
+      <div id="topology-scroll" class="stage-frame">
+        <svg id="topology-svg" viewBox="0 0 720 320" role="img"
+             aria-label="Authority and shards"></svg>
+      </div>
+      <p class="hint">Click a shard to crash or restart. Hold Shift and click to partition or heal its link to the authority.</p>
+    </section>
+
+    <section class="bottom">
+      <div class="shards-block">
+        <div class="block-head">
+          <h2>Shards</h2>
+          <form id="search-form" class="search">
+            <select id="search-shard" aria-label="Shard"></select>
+            <button class="btn" type="submit">Search</button>
+          </form>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th></th>
+              <th>Wallet</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody id="shard-table-body"></tbody>
+        </table>
+      </div>
+
+      <div class="log-block">
+        <div class="block-head">
+          <h2>Messages</h2>
+          <select id="event-filter" aria-label="Filter">
+            <option value="IMPORTANT" selected>Important</option>
+            <option value="ALL">All</option>
+            <option value="SEND">Send</option>
+            <option value="DELIVER">Deliver</option>
+            <option value="CONTROL">Control</option>
+            <option value="PARTITION">Partition</option>
+          </select>
+        </div>
+        <p id="timeline-note" class="note" aria-live="polite"></p>
+        <ul id="event-list" class="log"></ul>
+      </div>
+    </section>
+  </main>
+
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+  <!-- Hidden fields kept for API compatibility with previous controls -->
+  <select id="advance-select" hidden>
+    <option value="10000000" selected>10 ms</option>
+  </select>
+  <span id="event-count" hidden></span>
+  <span id="pending-event" hidden></span>
+  <code id="trace-digest" hidden></code>
+</body>
+</html>

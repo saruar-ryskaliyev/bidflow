@@ -1,7 +1,8 @@
-package io.bidflow.budget;
+package io.bidflow.budget.sim;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
+import io.bidflow.budget.BudgetAuthority;
 import io.bidflow.sim.NetworkConditions;
 import io.bidflow.sim.Simulation;
 import io.bidflow.sim.Trace;
@@ -260,7 +261,7 @@ class BudgetReclaimTest {
             final BudgetCluster cluster = run.apply(seed);
             spent += cluster.deliveredFraction();
             overspend += cluster.overspendFraction();
-            reclaimed += (double) cluster.authority().reclaimedMicros() / cluster.config().budgetMicros;
+            reclaimed += (double) cluster.authority().reclaimedMicros() / cluster.config().budgetMicros();
             boundHolds &= cluster.overspendMicros() <= cluster.authority().reclaimedMicros();
         }
         return new Averages(
@@ -281,14 +282,14 @@ class BudgetReclaimTest {
      */
     private static BudgetCluster runSkewed(long seed, long marginNanos, long leaseMicros) {
         final Simulation sim = new Simulation(seed, Trace.disabled());
-        final BudgetCluster.Config config = new BudgetCluster.Config()
+        final BudgetClusterConfig config = new BudgetClusterConfig()
                 .reclaimMarginNanos(marginNanos)
                 .leaseMicros(leaseMicros)
                 .leaseDurationNanos(100 * MILLIS);
         config.sweepIntervalNanos = 2 * MILLIS;
         config.reportIntervalNanos = 10 * MILLIS;
 
-        final long[] skew = new long[config.shardCount];
+        final long[] skew = new long[config.shardCount()];
         java.util.Arrays.fill(skew, -SKEW);
 
         final BudgetCluster cluster = new BudgetCluster(sim, config, NetworkConditions.lan(), skew);
@@ -307,7 +308,7 @@ class BudgetReclaimTest {
         final Simulation sim = new Simulation(seed, Trace.disabled());
 
         final int shards = 2 + sim.random().nextInt(11);
-        final BudgetCluster.Config config = new BudgetCluster.Config()
+        final BudgetClusterConfig config = new BudgetClusterConfig()
                 .shardCount(shards)
                 .reclaimMarginNanos(marginNanos)
                 .leaseMicros(leaseMicros)

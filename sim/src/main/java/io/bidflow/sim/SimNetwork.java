@@ -30,6 +30,7 @@ public final class SimNetwork {
 
     private final Simulation simulation;
     private final NetworkConditions conditions;
+    private final NetworkObserver observer;
     private final int nodeCount;
     private final boolean[] blocked;
 
@@ -40,11 +41,23 @@ public final class SimNetwork {
     private long partitionedAway;
 
     public SimNetwork(Simulation simulation, int nodeCount, NetworkConditions conditions) {
+        this(simulation, nodeCount, conditions, NetworkObserver.noop());
+    }
+
+    public SimNetwork(
+            Simulation simulation,
+            int nodeCount,
+            NetworkConditions conditions,
+            NetworkObserver observer) {
         if (nodeCount <= 0) {
             throw new IllegalArgumentException("nodeCount must be positive, was " + nodeCount);
         }
+        if (observer == null) {
+            throw new IllegalArgumentException("observer must not be null");
+        }
         this.simulation = simulation;
         this.conditions = conditions;
+        this.observer = observer;
         this.nodeCount = nodeCount;
         this.blocked = new boolean[nodeCount * nodeCount];
     }
@@ -59,6 +72,7 @@ public final class SimNetwork {
         checkNode(from, "from");
         checkNode(to, "to");
         sent++;
+        observe(NetworkEvent.send(simulation.now(), from, to, label));
 
         final boolean lost = simulation.random().nextDouble() < conditions.dropProbability();
         final long latency = drawLatency();
@@ -70,16 +84,19 @@ public final class SimNetwork {
         if (blocked[from * nodeCount + to]) {
             partitionedAway++;
             simulation.log("blocked " + label + " " + from + "->" + to);
+            observe(NetworkEvent.block(simulation.now(), from, to, label));
             return;
         }
         if (lost) {
             dropped++;
             simulation.log("dropped " + label + " " + from + "->" + to);
+            observe(NetworkEvent.drop(simulation.now(), from, to, label));
             return;
         }
         schedule(from, to, label, delivery, latency, false);
         if (duplicate) {
             duplicated++;
+            observe(NetworkEvent.duplicate(simulation.now(), from, to, label));
             schedule(from, to, label, delivery, duplicateLatency, true);
         }
     }
@@ -88,6 +105,7 @@ public final class SimNetwork {
         simulation.schedule(latency, to, () -> {
             delivered++;
             simulation.log("recv " + label + " " + from + "->" + to + (copy ? " (duplicate)" : ""));
+            observe(NetworkEvent.deliver(simulation.now(), from, to, label, copy));
             delivery.deliver();
         });
     }
@@ -115,6 +133,7 @@ public final class SimNetwork {
         checkNode(to, "to");
         blocked[from * nodeCount + to] = true;
         simulation.log("partition " + from + "->" + to);
+        observe(NetworkEvent.partition(simulation.now(), from, to));
     }
 
     /** Cuts a node off from every other node in both directions. */
@@ -133,11 +152,13 @@ public final class SimNetwork {
         blocked[a * nodeCount + b] = false;
         blocked[b * nodeCount + a] = false;
         simulation.log("heal " + a + "<->" + b);
+        observe(NetworkEvent.heal(simulation.now(), a, b));
     }
 
     public void healAll() {
         Arrays.fill(blocked, false);
         simulation.log("heal all");
+        observe(NetworkEvent.heal(simulation.now(), -1, -1));
     }
 
     public boolean isBlocked(int from, int to) {
@@ -173,6 +194,10 @@ public final class SimNetwork {
 
     public long partitionedCount() {
         return partitionedAway;
+    }
+
+    private void observe(NetworkEvent event) {
+        observer.onEvent(event);
     }
 
     private void checkNode(int node, String name) {
