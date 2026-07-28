@@ -66,6 +66,7 @@ public final class BudgetAuthority {
     private final long budgetMicros;
     private final long leaseDurationNanos;
     private final long reclaimMarginNanos;
+    private final LeaseGrantPolicy grantPolicy;
 
     private final long[] incarnations;
     private final long[] nextLeaseIds;
@@ -84,8 +85,12 @@ public final class BudgetAuthority {
     private long releasedMicros;
     private long reclaimedMicros;
     private long restartsObserved;
+    private long leasesPaced;
 
     /**
+     * Unpaced authority — grants whatever headroom allows. Prefer the overload that takes a
+     * {@link LeaseGrantPolicy} when spend should follow a target curve.
+     *
      * @param leaseDurationNanos how long each lease stays valid. Also the cap on what a single
      *     unreachable shard can cost, since exposure per lost lease is bounded by its size.
      * @param reclaimMarginNanos how long after expiry the authority waits before taking a lease
@@ -94,6 +99,19 @@ public final class BudgetAuthority {
      */
     public BudgetAuthority(
             long budgetMicros, int shardCount, long leaseDurationNanos, long reclaimMarginNanos) {
+        this(budgetMicros, shardCount, leaseDurationNanos, reclaimMarginNanos, UnpacedGrantPolicy.INSTANCE);
+    }
+
+    /**
+     * @param grantPolicy caps {@code wantedMicros} before a lease is minted; use
+     *     {@link UnpacedGrantPolicy#INSTANCE} for the historical behaviour
+     */
+    public BudgetAuthority(
+            long budgetMicros,
+            int shardCount,
+            long leaseDurationNanos,
+            long reclaimMarginNanos,
+            LeaseGrantPolicy grantPolicy) {
         if (budgetMicros < 0) {
             throw new IllegalArgumentException("budgetMicros must not be negative, was " + budgetMicros);
         }
@@ -108,9 +126,13 @@ public final class BudgetAuthority {
             throw new IllegalArgumentException(
                     "reclaimMarginNanos must not be negative, was " + reclaimMarginNanos);
         }
+        if (grantPolicy == null) {
+            throw new IllegalArgumentException("grantPolicy must not be null");
+        }
         this.budgetMicros = budgetMicros;
         this.leaseDurationNanos = leaseDurationNanos;
         this.reclaimMarginNanos = reclaimMarginNanos;
+        this.grantPolicy = grantPolicy;
         this.incarnations = new long[shardCount];
         this.nextLeaseIds = new long[shardCount];
     }
@@ -173,8 +195,12 @@ public final class BudgetAuthority {
             return new Lease(pending.leaseId, pending.amountMicros, pending.expiresAtNanos);
         }
 
+        final long pacedWanted = grantPolicy.capWantedMicros(wantedMicros, observedSpendMicros(), nowNanos);
+        if (pacedWanted < wantedMicros) {
+            leasesPaced++;
+        }
         final long headroom = budgetMicros - settledMicros - outstandingMicros;
-        final long amount = Math.min(wantedMicros, headroom);
+        final long amount = Math.min(pacedWanted, headroom);
         if (amount <= 0) {
             leasesExhausted++;
             return null;
@@ -341,6 +367,18 @@ public final class BudgetAuthority {
         return budgetMicros - settledMicros - outstandingMicros;
     }
 
+    /**
+     * Best current estimate of spend: settled totals plus the latest reported figure on every
+     * live lease. Pacing uses this rather than settled alone so in-flight spend is visible.
+     */
+    public long observedSpendMicros() {
+        long observed = settledMicros;
+        for (int i = 0; i < outstanding.size(); i++) {
+            observed += outstanding.get(i).reportedSpentMicros;
+        }
+        return observed;
+    }
+
     public int outstandingLeaseCount() {
         return outstanding.size();
     }
@@ -367,6 +405,11 @@ public final class BudgetAuthority {
     /** Requests that found the budget fully committed. */
     public long leasesExhausted() {
         return leasesExhausted;
+    }
+
+    /** Requests whose face value was reduced by the grant policy before minting. */
+    public long leasesPaced() {
+        return leasesPaced;
     }
 
     public long leasesSuperseded() {

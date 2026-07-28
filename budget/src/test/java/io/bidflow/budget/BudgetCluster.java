@@ -7,6 +7,8 @@ import io.bidflow.sim.NetworkConditions;
 import io.bidflow.sim.NodeClock;
 import io.bidflow.sim.SimNetwork;
 import io.bidflow.sim.Simulation;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * A whole budget-enforcement deployment inside the simulator: one authority, many serving
@@ -56,6 +58,19 @@ final class BudgetCluster {
         long minRequestIntervalNanos = 500_000L;
         long maxRequestIntervalNanos = 1_500_000L;
 
+        /**
+         * When true, early traffic is denser than late traffic — the shape pacing exists to
+         * smooth out. The first half of the run draws from the short end of the interval
+         * range; the second half draws from the long end.
+         */
+        boolean frontLoadedTraffic = false;
+
+        /** Optional pacing; null keeps the historical unpaced grant behaviour. */
+        LeaseGrantPolicy grantPolicy = null;
+
+        /** How often to snapshot cumulative spend for pacing curve checks; 0 disables. */
+        long checkpointIntervalNanos = 0L;
+
         /** The auction each request runs. Our campaign competes against seeded rivals. */
         int slots = 3;
 
@@ -99,6 +114,31 @@ final class BudgetCluster {
             lowWaterMicros = value;
             return this;
         }
+
+        Config frontLoadedTraffic(boolean value) {
+            frontLoadedTraffic = value;
+            return this;
+        }
+
+        Config grantPolicy(LeaseGrantPolicy value) {
+            grantPolicy = value;
+            return this;
+        }
+
+        Config checkpointIntervalNanos(long value) {
+            checkpointIntervalNanos = value;
+            return this;
+        }
+
+        Config minRequestIntervalNanos(long value) {
+            minRequestIntervalNanos = value;
+            return this;
+        }
+
+        Config maxRequestIntervalNanos(long value) {
+            maxRequestIntervalNanos = value;
+            return this;
+        }
     }
 
     /** The campaign whose budget is enforced; competitors carry ids from 100 upward. */
@@ -129,6 +169,10 @@ final class BudgetCluster {
     private long lostAuctions;
     private long restarts;
 
+    /** Cumulative spend samples taken on the authority clock; empty when checkpoints are off. */
+    private final List<long[]> spendCheckpoints = new ArrayList<>();
+    private long runHorizonNanos;
+
     BudgetCluster(Simulation sim, Config config, NetworkConditions conditions) {
         this(sim, config, conditions, new long[config.shardCount]);
     }
@@ -141,8 +185,13 @@ final class BudgetCluster {
         this.sim = sim;
         this.config = config;
         this.net = new SimNetwork(sim, config.shardCount + 1, conditions);
-        this.authority = new BudgetAuthority(
-                config.budgetMicros, config.shardCount, config.leaseDurationNanos, config.reclaimMarginNanos);
+        this.authority = config.grantPolicy == null
+                ? new BudgetAuthority(
+                        config.budgetMicros, config.shardCount, config.leaseDurationNanos,
+                        config.reclaimMarginNanos)
+                : new BudgetAuthority(
+                        config.budgetMicros, config.shardCount, config.leaseDurationNanos,
+                        config.reclaimMarginNanos, config.grantPolicy);
         this.authorityClock = new NodeClock(sim, 0L);
         this.wallets = new SpendAuthority[config.shardCount];
         this.clocks = new NodeClock[config.shardCount];
@@ -175,6 +224,32 @@ final class BudgetCluster {
     }
 
     /**
+     * Starts traffic and, when configured, spend checkpoints over a known horizon so a pacing
+     * test can compare cumulative delivery against the target curve.
+     */
+    void start(long runHorizonNanos) {
+        this.runHorizonNanos = runHorizonNanos;
+        start();
+        if (config.checkpointIntervalNanos > 0) {
+            scheduleCheckpoint(config.checkpointIntervalNanos);
+        }
+    }
+
+    private void scheduleCheckpoint(long atNanos) {
+        if (atNanos > runHorizonNanos) {
+            return;
+        }
+        final long delay = atNanos - sim.now();
+        if (delay < 0) {
+            return;
+        }
+        sim.schedule(delay, AUTHORITY_NODE, () -> {
+            spendCheckpoints.add(new long[] {sim.now(), actualSpendMicros});
+            scheduleCheckpoint(atNanos + config.checkpointIntervalNanos);
+        });
+    }
+
+    /**
      * Kills a shard's process and starts a replacement.
      *
      * <p>The wallet is discarded rather than carried over, because it lived in memory. The
@@ -199,8 +274,7 @@ final class BudgetCluster {
     }
 
     private void scheduleTraffic(int shard) {
-        final long span = config.maxRequestIntervalNanos - config.minRequestIntervalNanos;
-        final long delay = config.minRequestIntervalNanos + (span == 0 ? 0 : sim.random().nextLong(span + 1));
+        final long delay = nextRequestDelay();
         sim.schedule(delay, nodeOf(shard), () -> {
             final long now = clocks[shard].nanos();
             serveOne(shard, now);
@@ -208,6 +282,23 @@ final class BudgetCluster {
             maybeReport(shard, now);
             scheduleTraffic(shard);
         });
+    }
+
+    /**
+     * Uniform traffic draws from the full interval range. Front-loaded traffic uses the short
+     * end early and the long end late, so demand piles up before noon without pacing.
+     */
+    private long nextRequestDelay() {
+        if (!config.frontLoadedTraffic) {
+            final long span = config.maxRequestIntervalNanos - config.minRequestIntervalNanos;
+            return config.minRequestIntervalNanos + (span == 0 ? 0 : sim.random().nextLong(span + 1));
+        }
+        final long mid = runHorizonNanos > 0 ? runHorizonNanos / 2 : Long.MAX_VALUE / 2;
+        final boolean early = sim.now() < mid;
+        final long lo = early ? config.minRequestIntervalNanos : (config.minRequestIntervalNanos + config.maxRequestIntervalNanos) / 2;
+        final long hi = early ? (config.minRequestIntervalNanos + config.maxRequestIntervalNanos) / 2 : config.maxRequestIntervalNanos;
+        final long span = Math.max(0L, hi - lo);
+        return lo + (span == 0 ? 0 : sim.random().nextLong(span + 1));
     }
 
     /**
@@ -413,5 +504,10 @@ final class BudgetCluster {
 
     long restarts() {
         return restarts;
+    }
+
+    /** Snapshots of {@code [simNanos, actualSpendMicros]} when checkpointing is enabled. */
+    List<long[]> spendCheckpoints() {
+        return spendCheckpoints;
     }
 }
