@@ -1,0 +1,60 @@
+syntax = "proto3";
+
+package bidflow.v1;
+
+option java_multiple_files = true;
+option java_package = "io.bidflow.serving.v1";
+option java_outer_classname = "AuctionProto";
+
+// The auction service: run a GSP auction and record clicks against durable receipts.
+// Money is micros; quality is basis points — the same integer domain as AuctionEngine.
+service AuctionService {
+  rpc RunAuction(RunAuctionRequest) returns (RunAuctionResponse);
+  rpc RecordClick(RecordClickRequest) returns (RecordClickResponse);
+}
+
+message Candidate {
+  int64 campaign_id = 1;
+  int64 bid_micros = 2;
+  int32 quality_bps = 3;
+}
+
+message RunAuctionRequest {
+  int32 slots = 1;
+  int64 reserve_price_micros = 2;
+  repeated Candidate candidates = 3;
+}
+
+message Slot {
+  int64 campaign_id = 1;
+  int64 price_micros = 2;
+  int64 ad_rank = 3;
+  int32 quality_bps = 4;
+}
+
+message RunAuctionResponse {
+  // Opaque token binding this response to the serving shard and receipt store.
+  string auction_token = 1;
+  repeated Slot slots = 2;
+}
+
+message RecordClickRequest {
+  string auction_token = 1;
+  int32 slot = 2;
+  string idempotency_key = 3;
+}
+
+enum ClickStatus {
+  CLICK_STATUS_UNSPECIFIED = 0;
+  CLICK_CHARGED = 1;
+  CLICK_REPLAYED = 2;
+  CLICK_REFUSED = 3;
+  CLICK_CONFLICT = 4;
+  CLICK_INVALID = 5;
+}
+
+message RecordClickResponse {
+  ClickStatus status = 1;
+  int64 charged_micros = 2;
+  int64 campaign_id = 3;
+}
