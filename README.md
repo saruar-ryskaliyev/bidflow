@@ -108,26 +108,30 @@ fault-injection seeds. It has never been violated.
 
 ### Experiment 1 — the clock-skew boundary
 
-Every shard's clock runs 150 ms behind the authority. Healthy network, frequent reports, no
-faults, so shards always release their leases voluntarily and there is nothing legitimate left to
-reclaim. Twelve seeds per row.
+Every shard's clock runs 150 ms behind the authority — healthy network, frequent reports, no
+faults. Twelve seeds per row.
 
 | Reclaim margin | Spent | Overspend | Reclaimed |
 | --- | --- | --- | --- |
-| 0 ms | 136.04% | 36.04% | 137.10% |
-| 50 ms | 136.04% | 36.04% | 108.43% |
-| 100 ms | 117.52% | 17.52% | 69.47% |
-| 150 ms | 99.99% | **0.00%** | 0.00% |
-| 300 ms | 99.99% | **0.00%** | 0.00% |
+| 0 ms | 135.94% | 35.94% | 137.36% |
+| 50 ms | 135.94% | 35.94% | 108.65% |
+| 100 ms | 118.64% | 18.64% | 69.97% |
+| 150 ms | 100.19% | 0.19% | 3.55% |
+| 300 ms | 100.00% | 0.00% | 2.74% |
 
 An impatient authority takes leases back from shards that are still spending on them, and the
 overspend is severe — 36% of budget, and a reclaim total larger than the budget itself because
-the same money churns repeatedly. Once the margin covers the skew it collapses to exactly zero.
+the same money churns repeatedly. Once the margin covers the skew, the clock overspend is gone.
 
-The crossing is not quite at 150 ms, though. It sits somewhat below, because shards renew shortly
-*before* their lease expires, and sealing early shortens the window in which both parties believe
-they own the money. Proactive renewal buys safety margin for free — a small result, but one the
-experiment produced rather than one that was assumed.
+What remains at covered margins — a fifth of a percent at 150 ms, a thousandth at 300 ms — is a
+different animal, exposed by prefetched renewal. At the budget's exhaustion tail the authority
+has nothing left to grant, so a wallet that would once have sealed keeps spending its live
+lease; the sweeper eventually settles that lease at its last report, and whatever was spent
+after that report is freed and re-leased. The residue is bounded by one report interval of
+spending per shard — report lag, not clock skew — and it stays inside the
+overspend-is-bounded-by-reclaim theorem like everything else. The crossing between the regimes
+still sits below the skew, because a shard asks for its next lease ahead of expiry and stops
+spending the old one the moment the grant lands.
 
 ### Experiment 2 — the trade-off under crashes and partitions
 
@@ -137,52 +141,67 @@ Twelve seeds per row.
 
 | Configuration | Delivered | Overspend | Reclaimed |
 | --- | --- | --- | --- |
-| No expiry (the previous design) | 71.97% | **0.00%** | 0.00% |
-| Expiry, never reclaim | 56.12% | **0.00%** | 0.00% |
-| Expiry + reclaim, 500 ms margin | 57.61% | 0.095% | 16.92% |
-| Expiry + reclaim, 200 ms margin | 57.78% | 0.207% | 20.04% |
-| Expiry + reclaim, 100 ms margin | 57.82% | 0.247% | 23.57% |
-| Expiry + reclaim, 50 ms margin | 57.82% | 0.247% | 55.50% |
-| Expiry + reclaim, 0 ms margin | 58.70% | 1.123% | 132.13% |
+| No expiry (the previous design) | 73.92% | **0.00%** | 0.00% |
+| Expiry, never reclaim | 57.97% | **0.00%** | 0.00% |
+| Expiry + reclaim, 500 ms margin | 61.17% | 0.000% | 25.74% |
+| Expiry + reclaim, 200 ms margin | 62.63% | 0.056% | 31.04% |
+| Expiry + reclaim, 100 ms margin | 63.18% | 0.366% | 40.18% |
+| Expiry + reclaim, 50 ms margin | 63.24% | 0.423% | 83.64% |
+| Expiry + reclaim, 0 ms margin | 64.42% | 1.606% | 146.09% |
 
 Three findings.
 
-**Expiry on its own is a regression.** 56.12% against 71.97% for never expiring at all. A lease
-that lapses unspent is wasted twice — the holder may no longer spend it and the authority still
-does not take it back. Expiry is not a feature, it is an enabler, and it only pays off paired with
-reclaim.
+**Expiry's in-window cost is partition exposure, not protocol overhead.** With the request
+stampede and the renewal gap both fixed (below), a never-expiring lease serves straight through
+a partition — the wallet needs no contact — while an expiring lease dies within its duration and
+the shard goes dark until the partition heals. That is most of the sixteen-point gap between
+73.92% and 57.97%.
 
-**The renewal tax is now the visible cost of expiry.** With the request stampede fixed (see
-below), the never-expire baseline outdelivers every expiring configuration in this three-second
-window: the crashes that fit in it strand at most a few percent of budget, while expiry pays a
-continuous protocol tax — a sealed round trip per lease — worth about thirteen points of delivery
-at this lease duration. The trade is visible instead of hidden: expiry bounds what any single
-crash can cost at one lease of face value, and the premium for that insurance is the renewal
-tax, which is exactly the next inefficiency to attack. Over a horizon longer than an experiment,
-never-expiring leases lose ground again, because every crash strands its lease forever.
+**Reclaim moves money, not serving time.** Recovering an unreachable shard's lease and
+re-leasing it to shards that can still be reached claws back six and a half of those points
+(57.97% to 64.42%), and a patient 500 ms margin takes 3.2 of them with no measured overspend at
+all. The rest cannot be bought this way: the dark shard's requests are not being served by
+anyone, and money cannot fix that.
 
-**Aggressive margins churn far more than they recover.** Reclaim at a zero margin now buys 2.6
-points of delivery over never reclaiming, at 132% of budget in churn and 1.1% overspend — and
-before the stampede fix that churn read 433%, which says most of it was the sweeper recycling
-leases the stampede had stranded, not recovery of real losses.
+**The remaining gap is the price of revocability.** Within three seconds, never expiring wins on
+delivery — but its loss per crash is permanent, invisible in a window this short and unbounded
+over a day, while expiry caps every crash at one lease of face value plus a margin's wait. Which
+side of that trade to take is the business question the curve prices. The properties asserted
+are the ones that hold at any horizon: reclaim beats expiry alone, the configurations that never
+reclaim never overspend, and overspend never exceeds reclaim.
 
 The comparison against "no expiry" is measured under the identical fault mix rather than quoted
 from an earlier run. An improvement demonstrated against a differently-configured baseline would
 not be an improvement.
 
-### Known inefficiencies, one fixed and measured
+### Known inefficiencies, two fixed and measured
 
 **Fixed: the renewal request stampede.** A shard whose reply was slow used to ask again on its
 cooldown, and every retry minted another lease that stranded until the sweeper collected it. The
 authority now answers a retry by retransmitting the still-live previous grant — safe because the
-wallet already treats a duplicated grant as a no-op. Under the identical fault mix, the fix moved
-the no-expiry baseline from 53.57% to 71.97% delivered and cut zero-margin reclaim churn from
-433% of budget to 132% with overspend unchanged: most of that churn had been the sweeper
-recycling stampede strandings.
+wallet already treats a duplicated grant as a no-op. On its own this moved the no-expiry baseline
+from 53.57% to 71.97% delivered and cut zero-margin reclaim churn from 433% of budget to 132%
+with overspend unchanged: most of that churn had been the sweeper recycling stampede strandings.
 
-Two inefficiencies remain: sealing before renewal costs one round trip per lease during which
-the shard spends nothing — now the dominant cost of expiry — and a shard holding less than the
-price of a click cannot spend its remainder.
+**Fixed: the sealed renewal gap.** Renewal was seal-then-ask — the wallet stopped spending, asked,
+and served nothing for a round trip. It now prefetches: the wallet keeps spending its live lease
+while the next one is in flight, and installing the grant displaces the old lease into a pending
+release whose final figure travels by three idempotent carriers — an immediate release message,
+the next lease request, and the periodic reports. Worth roughly two to six points of delivery
+across the expiring configurations, on top of the stampede fix.
+
+The simulator caught two protocol bugs in the prefetch before any of it was trusted, both as
+seed-reproducible measurements rather than review comments. First, a request must tell the
+authority what it *holds* separately from what it *settles*: conflating the two made grant
+retransmission answer a prefetch with the lease the shard already had, starving it of the next —
+under never-expiring leases the starvation is permanent, and delivery collapsed to 19% until the
+ids were separated. Second, prefetch keeps exhausted-tail wallets spending where seal-then-ask
+had silenced them, which trades the old exactly-zero overspend at covered margins for a residue
+bounded by report lag — 0.19% at a margin equal to the skew, and the reason experiment 1's
+assertion now reads "bounded" rather than "zero".
+
+One inefficiency remains: a shard holding less than the price of a click cannot spend its
+remainder, though the prompt release now recycles displaced remainders quickly.
 
 ## The mechanism
 
@@ -359,9 +378,11 @@ experiments quantifying what reclaim costs and returns — with spend priced by 
 inside them — and the JMH microbenchmarks that turned the latency and allocation design goals
 into measurements.
 
-1. **Close the rest of the delivery gap** — expiry still costs about thirteen points of delivery
-   against the no-expiry baseline, and most of that is the sealed renewal round trip. Closing the
-   renewal gap should be worth more than any further tuning of the reclaim margin.
+1. **Price revocability over longer horizons** — in a three-second window, never-expiring leases
+   out-deliver expiry plus reclaim by nine points because a partitioned shard keeps serving from
+   its wallet, while their loss per crash is permanent and accumulates without bound. A run long
+   enough to show the crossover would turn the last qualitative claim in the results into a
+   measured one.
 2. **Pacing controller** — spend the budget smoothly across a day of varying traffic rather than
    exhausting it by mid-morning, built on the lease mechanism rather than beside it.
 3. **Simulation explorer** — a static site, generated by CI from a real run, replaying a

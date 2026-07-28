@@ -21,17 +21,28 @@ package io.bidflow.budget;
  * so the authority's safety margin has to cover it — that relationship is the whole subject of
  * the reclaim experiment, and it is why {@link io.bidflow.sim.NodeClock} exists.
  *
- * <h2>Sealing</h2>
+ * <h2>Renewal without a serving gap</h2>
  *
- * <p>Renewal is a two-part move: seal, then ask. {@link #sealForRenewal} stops spending and
- * returns a final figure, and only then does the shard tell the authority "lease 7 spent 340 of
- * its 500, please issue another". Sealing first is what makes that number trustworthy — report
- * a running total while still spending and the authority reclaims money that has since gone
- * out the door.
+ * <p>The healthy renewal path is a prefetch: the shard asks for the next lease while the
+ * current one is still live and keeps spending until the grant arrives. Installing the
+ * newer lease displaces the current one and parks its spend record as a <em>pending
+ * release</em> — a final figure, safe to settle, because displacement is the moment
+ * spending on it stops. The next request names that pending record and the authority
+ * settles it then. The figure travels one request later than it would under
+ * seal-then-ask, in exchange for the shard never pausing.
  *
- * <p>The cost is a serving gap of one round trip per renewal, during which this shard can spend
- * nothing. That is a real cost, but a small one: a lease lasting hundreds of milliseconds and a
- * round trip of hundreds of microseconds put the gap under a tenth of a percent.
+ * <p>Overwriting an earlier pending record at install time is safe for a reason worth
+ * spelling out: grants are only minted for requests, every request names the pending
+ * record that existed when it was sent, and the authority retransmits rather than mints
+ * when it has an unacknowledged live grant. A strictly newer lease arriving therefore
+ * proves the request that named the previous pending record was processed.
+ *
+ * <p><h2>Sealing</h2>
+ *
+ * <p>{@link #sealForRenewal} remains for the cases where prefetching is meaningless: the
+ * wallet is empty, or the lease has already expired on this shard's own clock. Sealing
+ * stops spending so the reported figure is final; it is idempotent, so a retried request
+ * carries the same number.
  *
  * <p><b>Not thread-safe.</b> One instance per request-handling thread.
  */
@@ -47,6 +58,10 @@ public final class SpendAuthority {
 
     /** Set when spending has stopped so that the reported figure is final. */
     private boolean sealed;
+
+    /** A displaced lease whose final figure still has to reach the authority. */
+    private long pendingReleaseId = Lease.NONE;
+    private long pendingReleaseSpentMicros;
 
     private long lifetimeSpentMicros;
 
@@ -96,10 +111,11 @@ public final class SpendAuthority {
     /**
      * Adopts a newly granted lease.
      *
-     * <p>Refuses a lease not newer than the one held, which makes a duplicated or reordered
-     * grant a no-op. Also refuses to displace a lease that is still live and unsealed: doing so
-     * would discard that lease's spend record while the authority still expects to be told it,
-     * and the authority would then reclaim money that had already been spent.
+     * <p>Refuses a lease not newer than the one held, which makes a duplicated, reordered, or
+     * retransmitted grant a no-op. A live unsealed lease is displaced rather than refused —
+     * this is the prefetch path — and its spend record is parked as the pending release so
+     * the authority can still be told the final figure. Discarding that record instead would
+     * let the authority settle low and re-lease money that had already been spent.
      *
      * @return true if the lease was adopted
      */
@@ -107,10 +123,12 @@ public final class SpendAuthority {
         if (lease.leaseId() <= leaseId) {
             return false;
         }
-        final boolean replaceable =
-                leaseId == Lease.NONE || sealed || nowNanos >= leaseExpiresAtNanos;
-        if (!replaceable) {
-            return false;
+        if (leaseId != Lease.NONE && !sealed && nowNanos < leaseExpiresAtNanos) {
+            // Displacement is the instant spending on the old lease stops, so this figure
+            // is final. Overwriting an earlier pending record here is safe: a strictly
+            // newer grant proves the request that named that record was processed.
+            pendingReleaseId = leaseId;
+            pendingReleaseSpentMicros = leaseSpentMicros;
         }
         leaseId = lease.leaseId();
         leaseAmountMicros = lease.amountMicros();
@@ -118,6 +136,16 @@ public final class SpendAuthority {
         leaseSpentMicros = 0L;
         sealed = false;
         return true;
+    }
+
+    /** The displaced lease awaiting settlement, or {@link Lease#NONE}. */
+    public long pendingReleaseId() {
+        return pendingReleaseId;
+    }
+
+    /** Final spend of the displaced lease; meaningful only while one is pending. */
+    public long pendingReleaseSpentMicros() {
+        return pendingReleaseSpentMicros;
     }
 
     /**

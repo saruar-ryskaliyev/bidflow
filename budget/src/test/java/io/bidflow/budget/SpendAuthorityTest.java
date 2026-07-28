@@ -137,15 +137,48 @@ class SpendAuthorityTest {
         }
 
         @Test
-        @DisplayName("refuses to displace a lease that is still live and unsealed")
-        void willNotDiscardAnUnsealedLease() {
+        @DisplayName("displacing a live lease parks its final figure instead of losing it")
+        void displacementParksTheSpendRecord() {
             final SpendAuthority wallet = walletWith(1_000L);
             wallet.tryReserve(T0, 700L);
 
-            // Overwriting now would lose the record of the 700 already spent, and the authority
-            // would settle that lease at whatever it last heard.
-            assertThat(wallet.installLease(new Lease(2L, 1_000L, EXPIRY), T0)).isFalse();
-            assertThat(wallet.leaseSpentMicros()).isEqualTo(700L);
+            // The prefetch path: the new lease takes over immediately, and the 700 already
+            // spent becomes the pending release the next request will settle. Dropping it
+            // would let the authority settle low and re-lease spent money.
+            assertThat(wallet.installLease(new Lease(2L, 800L, EXPIRY), T0)).isTrue();
+            assertThat(wallet.pendingReleaseId()).isEqualTo(1L);
+            assertThat(wallet.pendingReleaseSpentMicros()).isEqualTo(700L);
+            assertThat(wallet.leaseSpentMicros()).isZero();
+            assertThat(wallet.remainingMicros()).isEqualTo(800L);
+            assertThat(wallet.tryReserve(T0, 100L)).isTrue();
+        }
+
+        @Test
+        @DisplayName("a newer grant overwrites the previous pending release")
+        void newerGrantOverwritesThePending() {
+            final SpendAuthority wallet = walletWith(1_000L);
+            wallet.tryReserve(T0, 700L);
+            wallet.installLease(new Lease(2L, 800L, EXPIRY), T0);
+            wallet.tryReserve(T0, 150L);
+
+            // A strictly newer grant proves the request that named pending lease 1 was
+            // processed, so replacing that record with lease 2's figure is safe.
+            assertThat(wallet.installLease(new Lease(3L, 900L, EXPIRY), T0)).isTrue();
+            assertThat(wallet.pendingReleaseId()).isEqualTo(2L);
+            assertThat(wallet.pendingReleaseSpentMicros()).isEqualTo(150L);
+        }
+
+        @Test
+        @DisplayName("adopting over a sealed or expired lease leaves nothing pending")
+        void sealedAdoptionLeavesNothingPending() {
+            final SpendAuthority wallet = walletWith(1_000L);
+            wallet.tryReserve(T0, 300L);
+            wallet.sealForRenewal();
+
+            // The sealed figure travelled with the request that produced this grant, so
+            // there is nothing left to park.
+            assertThat(wallet.installLease(new Lease(2L, 800L, EXPIRY), T0)).isTrue();
+            assertThat(wallet.pendingReleaseId()).isEqualTo(Lease.NONE);
         }
 
         @Test

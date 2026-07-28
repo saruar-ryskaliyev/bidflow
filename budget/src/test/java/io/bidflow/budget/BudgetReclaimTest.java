@@ -138,15 +138,22 @@ class BudgetReclaimTest {
      * Isolates the clock-disagreement effect: a healthy network, frequent reports, no faults, and
      * every shard's clock running {@link #SKEW} behind the authority.
      *
-     * <p>With no faults, shards always release their leases voluntarily, so a patient authority
-     * never reclaims anything and overspend is exactly zero. An impatient one takes leases back
-     * from shards that are still spending on them, and overspend follows.
+     * <p>A margin under the skew takes leases back from shards that are still spending on them,
+     * and overspend follows. A margin covering the skew eliminates that clock overspend — but not
+     * quite all overspend, and the residue is itself a finding. Under the old seal-then-ask
+     * renewal a shard fell silent one round trip before every renewal, so at the budget's
+     * exhaustion tail — when the authority had nothing left to grant — wallets were already
+     * sealed and the sweeper found nothing to take. Prefetch keeps those wallets spending their
+     * live lease right up to their own view of its expiry, so the sweeper settles the tail
+     * leases at their last report, and whatever was spent since that report is freed and
+     * re-leased. That residue is bounded by report lag, not by clock skew: one report interval
+     * of spending per shard, a fraction of a percent here, and always inside the
+     * overspend-is-bounded-by-reclaim theorem.
      *
-     * <p>The crossing between the two is not at the skew itself but somewhat below it, because
-     * shards renew a little before their lease expires. Sealing early shortens the window in which
-     * the authority and the holder disagree, so proactive renewal buys safety margin for free. The
-     * assertions therefore check either side of the crossing rather than pinning its exact
-     * location, which depends on the renewal lead time and the sweep interval as well as the skew.
+     * <p>The crossing between the regimes still sits below the skew, because a shard asks for
+     * its next lease a little before expiry and stops spending the old lease the moment the
+     * grant lands. The assertions check either side of the crossing rather than pinning its
+     * exact location, which depends on the renewal lead, latency, and the sweep interval.
      */
     @Test
     @DisplayName("experiment 1: overspend appears when the margin is under the clock skew")
@@ -164,10 +171,12 @@ class BudgetReclaimTest {
                     averages.reclaimed * 100);
 
             if (margin >= SKEW) {
-                // Past the skew the authority cannot take money from a shard still spending it, and
-                // with no faults there is nothing else left to take.
-                assertThat(averages.overspend).as("margin %dms covers the skew", margin / MILLIS).isZero();
-                assertThat(averages.reclaimed).as("nothing to reclaim when shards release").isZero();
+                // Past the skew the authority cannot take money from a shard still spending
+                // it. What remains is the exhaustion-tail residue described above, bounded
+                // by one report interval of spending — far under half a percent here.
+                assertThat(averages.overspend)
+                        .as("margin %dms covers the skew", margin / MILLIS)
+                        .isLessThan(0.005);
             } else if (margin <= 100 * MILLIS) {
                 // Comfortably inside the crossing, so the overlap is real and money is taken from
                 // shards that go on spending it.
@@ -227,16 +236,17 @@ class BudgetReclaimTest {
         assertThat(bestDelivery).as("reclaim should recover delivery the safe setting leaves stranded")
                 .isGreaterThan(safeDelivery);
 
-        // The question that decides whether this whole mechanism was worth building: expiry plus
-        // reclaim has to beat never expiring at all. Expiry on its own is strictly worse, because a
-        // lease that lapses unspent is wasted by the holder and still not recovered by the
-        // authority — so the two halves only pay off together.
+        // Within this window, never-expiring leases deliver the most: a partitioned shard
+        // keeps serving from its wallet, while an expiring lease dies and its shard goes
+        // dark until the partition heals. Reclaim claws back much of that gap by
+        // re-leasing recovered money to shards that are reachable — money moves, serving
+        // time does not. What no-expiry cannot bound is its permanent loss per crash,
+        // invisible in three seconds and unbounded over a day. The curve prices that
+        // trade; what is asserted is what must hold at any horizon — reclaim beats expiry
+        // alone, and the configurations that never reclaim never overspend.
         System.out.printf(
                 "  -> best with reclaim %.2f%% vs no expiry %.2f%% vs expiry alone %.2f%%%n",
                 bestDelivery * 100, Math.min(noExpiry.spent, 1.0) * 100, safeDelivery * 100);
-        assertThat(safeDelivery)
-                .as("expiry without reclaim should be worse than no expiry at all")
-                .isLessThan(noExpiry.spent);
     }
 
     private record Averages(double spent, double overspend, double reclaimed, boolean boundHolds) {}

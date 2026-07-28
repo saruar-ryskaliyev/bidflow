@@ -17,9 +17,9 @@ class BudgetAuthorityTest {
         return new BudgetAuthority(budget, shards, LEASE_DURATION, MARGIN);
     }
 
-    /** Convenience for the common case of a first lease with nothing to settle. */
+    /** Convenience for the common case of a first lease: nothing held, nothing to settle. */
     private static Lease firstLease(BudgetAuthority bank, int shard, long wanted, long now) {
-        return bank.requestLease(shard, 1L, Lease.NONE, 0L, wanted, now);
+        return bank.requestLease(shard, 1L, Lease.NONE, Lease.NONE, 0L, wanted, now);
     }
 
     @Nested
@@ -46,7 +46,7 @@ class BudgetAuthorityTest {
         void neverCommitsBeyondTheBudget() {
             final BudgetAuthority bank = bank(1_000L, 4);
             for (int shard = 0; shard < 4; shard++) {
-                bank.requestLease(shard, 1L, Lease.NONE, 0L, 800L, T0);
+                bank.requestLease(shard, 1L, Lease.NONE, Lease.NONE, 0L, 800L, T0);
             }
 
             assertThat(bank.settledMicros() + bank.outstandingMicros()).isEqualTo(1_000L);
@@ -79,8 +79,10 @@ class BudgetAuthorityTest {
             // which the grant-retransmission tests pin down separately.
             final BudgetAuthority bank = bank(1_000L, 1);
             final Lease first = firstLease(bank, 0, 100L, T0);
-            final Lease second = bank.requestLease(0, 1L, first.leaseId(), 50L, 100L, T0);
-            final Lease third = bank.requestLease(0, 1L, second.leaseId(), 50L, 100L, T0);
+            final Lease second =
+                    bank.requestLease(0, 1L, first.leaseId(), first.leaseId(), 50L, 100L, T0);
+            final Lease third =
+                    bank.requestLease(0, 1L, second.leaseId(), second.leaseId(), 50L, 100L, T0);
 
             assertThat(second.leaseId()).isGreaterThan(first.leaseId());
             assertThat(third.leaseId()).isGreaterThan(second.leaseId());
@@ -97,7 +99,7 @@ class BudgetAuthorityTest {
             final BudgetAuthority bank = bank(1_000L, 1);
             final Lease lease = firstLease(bank, 0, 500L, T0);
 
-            bank.requestLease(0, 1L, lease.leaseId(), 340L, 500L, T0);
+            bank.requestLease(0, 1L, lease.leaseId(), lease.leaseId(), 340L, 500L, T0);
 
             // 340 spent, so 160 comes back and is available to lease again.
             assertThat(bank.settledMicros()).isEqualTo(340L);
@@ -106,14 +108,32 @@ class BudgetAuthorityTest {
         }
 
         @Test
+        @DisplayName("a prompt release settles the final figure without granting anything")
+        void promptReleaseSettlesWithoutGranting() {
+            final BudgetAuthority bank = bank(1_000L, 1);
+            final Lease lease = firstLease(bank, 0, 500L, T0);
+
+            bank.releaseSealed(0, 1L, lease.leaseId(), 340L);
+
+            assertThat(bank.settledMicros()).isEqualTo(340L);
+            assertThat(bank.releasedMicros()).isEqualTo(160L);
+            assertThat(bank.outstandingLeaseCount()).isZero();
+            assertThat(bank.leasesIssued()).isEqualTo(1L);
+
+            // Racing renewal or duplicate: nothing left to settle, nothing double-counted.
+            bank.releaseSealed(0, 1L, lease.leaseId(), 340L);
+            assertThat(bank.settledMicros()).isEqualTo(340L);
+        }
+
+        @Test
         @DisplayName("releasing the same lease twice does not double-count")
         void releaseIsIdempotent() {
             final BudgetAuthority bank = bank(1_000L, 1);
             final Lease lease = firstLease(bank, 0, 500L, T0);
 
-            bank.requestLease(0, 1L, lease.leaseId(), 340L, 100L, T0);
+            bank.requestLease(0, 1L, lease.leaseId(), lease.leaseId(), 340L, 100L, T0);
             final long settledOnce = bank.settledMicros();
-            bank.requestLease(0, 1L, lease.leaseId(), 340L, 100L, T0);
+            bank.requestLease(0, 1L, lease.leaseId(), lease.leaseId(), 340L, 100L, T0);
 
             assertThat(bank.settledMicros()).isEqualTo(settledOnce);
         }
@@ -124,7 +144,7 @@ class BudgetAuthorityTest {
             final BudgetAuthority bank = bank(1_000L, 1);
             final Lease lease = firstLease(bank, 0, 500L, T0);
 
-            bank.requestLease(0, 1L, lease.leaseId(), 99_999L, 0L, T0);
+            bank.requestLease(0, 1L, lease.leaseId(), lease.leaseId(), 99_999L, 0L, T0);
             assertThat(bank.settledMicros()).isEqualTo(500L);
         }
 
@@ -137,7 +157,7 @@ class BudgetAuthorityTest {
 
             // A release claiming less than a report already seen would free money known to be
             // spent, so the higher figure wins.
-            bank.requestLease(0, 1L, lease.leaseId(), 100L, 0L, T0);
+            bank.requestLease(0, 1L, lease.leaseId(), lease.leaseId(), 100L, 0L, T0);
             assertThat(bank.settledMicros()).isEqualTo(400L);
         }
     }
@@ -220,8 +240,8 @@ class BudgetAuthorityTest {
             final BudgetAuthority bank = bank(1_000L, 1);
             final Lease first = firstLease(bank, 0, 300L, T0);
 
-            // The reply was slow or lost, so the shard asks again without naming a seal.
-            final Lease retry = bank.requestLease(0, 1L, Lease.NONE, 0L, 300L, T0 + 10);
+            // The reply was slow or lost, so the shard asks again holding nothing.
+            final Lease retry = bank.requestLease(0, 1L, Lease.NONE, Lease.NONE, 0L, 300L, T0 + 10);
 
             assertThat(retry.leaseId()).isEqualTo(first.leaseId());
             assertThat(retry.amountMicros()).isEqualTo(first.amountMicros());
@@ -233,6 +253,25 @@ class BudgetAuthorityTest {
         }
 
         @Test
+        @DisplayName("a prefetch from a shard already holding the newest grant mints fresh")
+        void prefetchFromHolderMintsFresh() {
+            final BudgetAuthority bank = bank(1_000L, 1);
+            final Lease first = firstLease(bank, 0, 300L, T0);
+
+            // The shard installed the grant and prefetches while still spending it: held
+            // says so, and nothing is sealed yet. Retransmitting here would starve the
+            // shard of its next lease — the loop the held/settled distinction exists for.
+            final Lease next = bank.requestLease(
+                    0, 1L, first.leaseId(), Lease.NONE, 0L, 300L, T0 + 10);
+
+            assertThat(next.leaseId()).isGreaterThan(first.leaseId());
+            assertThat(bank.leasesRetransmitted()).isZero();
+            // Both live until the displaced lease's release lands, and that is the point:
+            // the shard never stops spending.
+            assertThat(bank.outstandingLeaseCount()).isEqualTo(2);
+        }
+
+        @Test
         @DisplayName("an expired pending grant is not retransmitted")
         void expiredGrantIsNotRetransmitted() {
             final BudgetAuthority bank = bank(1_000L, 1);
@@ -241,7 +280,7 @@ class BudgetAuthorityTest {
             // Past expiry the old grant is useless to the holder; it waits for the
             // sweeper while a fresh lease is minted from the remaining headroom.
             final Lease retry = bank.requestLease(
-                    0, 1L, Lease.NONE, 0L, 300L, first.expiresAtNanos());
+                    0, 1L, Lease.NONE, Lease.NONE, 0L, 300L, first.expiresAtNanos());
 
             assertThat(retry.leaseId()).isGreaterThan(first.leaseId());
             assertThat(bank.leasesRetransmitted()).isZero();
@@ -253,9 +292,10 @@ class BudgetAuthorityTest {
         void renewalAfterRetransmissionMintsFresh() {
             final BudgetAuthority bank = bank(1_000L, 1);
             final Lease first = firstLease(bank, 0, 300L, T0);
-            bank.requestLease(0, 1L, Lease.NONE, 0L, 300L, T0 + 10);
+            bank.requestLease(0, 1L, Lease.NONE, Lease.NONE, 0L, 300L, T0 + 10);
 
-            final Lease next = bank.requestLease(0, 1L, first.leaseId(), 120L, 300L, T0 + 20);
+            final Lease next =
+                    bank.requestLease(0, 1L, first.leaseId(), first.leaseId(), 120L, 300L, T0 + 20);
 
             assertThat(next.leaseId()).isGreaterThan(first.leaseId());
             assertThat(bank.settledMicros()).isEqualTo(120L);
@@ -302,7 +342,8 @@ class BudgetAuthorityTest {
             final BudgetAuthority bank = bank(1_000L, 1);
             firstLease(bank, 0, 400L, T0);
 
-            final Lease afterRestart = bank.requestLease(0, 2L, Lease.NONE, 0L, 100L, T0);
+            final Lease afterRestart =
+                    bank.requestLease(0, 2L, Lease.NONE, Lease.NONE, 0L, 100L, T0);
             assertThat(afterRestart.amountMicros()).isEqualTo(100L);
             assertThat(bank.restartsObserved()).isEqualTo(1L);
         }
@@ -312,7 +353,7 @@ class BudgetAuthorityTest {
         void deadLeaseIsSweptNotDiscarded() {
             final BudgetAuthority bank = bank(1_000L, 1);
             final Lease dead = firstLease(bank, 0, 400L, T0);
-            bank.requestLease(0, 2L, Lease.NONE, 0L, 100L, T0);
+            bank.requestLease(0, 2L, Lease.NONE, Lease.NONE, 0L, 100L, T0);
 
             assertThat(bank.outstandingLeaseCount()).isEqualTo(2);
 
@@ -326,9 +367,9 @@ class BudgetAuthorityTest {
         @DisplayName("refuses a request from a process already replaced")
         void supersededRequestIsRefused() {
             final BudgetAuthority bank = bank(1_000L, 1);
-            bank.requestLease(0, 2L, Lease.NONE, 0L, 100L, T0);
+            bank.requestLease(0, 2L, Lease.NONE, Lease.NONE, 0L, 100L, T0);
 
-            assertThat(bank.requestLease(0, 1L, Lease.NONE, 0L, 100L, T0)).isNull();
+            assertThat(bank.requestLease(0, 1L, Lease.NONE, Lease.NONE, 0L, 100L, T0)).isNull();
             assertThat(bank.leasesSuperseded()).isEqualTo(1L);
         }
     }
@@ -337,7 +378,7 @@ class BudgetAuthorityTest {
     @DisplayName("rejects an unknown shard")
     void rejectsUnknownShard() {
         final BudgetAuthority bank = bank(1_000L, 2);
-        assertThatThrownBy(() -> bank.requestLease(2, 1L, Lease.NONE, 0L, 100L, T0))
+        assertThatThrownBy(() -> bank.requestLease(2, 1L, Lease.NONE, Lease.NONE, 0L, 100L, T0))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("shardId");
     }

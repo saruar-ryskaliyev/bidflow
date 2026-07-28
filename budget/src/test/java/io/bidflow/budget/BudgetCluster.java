@@ -120,6 +120,9 @@ final class BudgetCluster {
     private final AuctionRequest[] requests;
     private final AuctionOutcome[] outcomes;
 
+    /** The cheapest price a won slot can carry; below this a wallet cannot spend at all. */
+    private final long minPriceFloorMicros;
+
     private long actualSpendMicros;
     private long servedRequests;
     private long refusedRequests;
@@ -149,6 +152,8 @@ final class BudgetCluster {
         this.engines = new AuctionEngine[config.shardCount];
         this.requests = new AuctionRequest[config.shardCount];
         this.outcomes = new AuctionOutcome[config.shardCount];
+        this.minPriceFloorMicros = Math.ceilDiv(
+                config.reserveMicros * AuctionRequest.QUALITY_ONE_BPS, config.ourQualityBps);
 
         for (int shard = 0; shard < config.shardCount; shard++) {
             incarnations[shard] = 1L;
@@ -256,12 +261,16 @@ final class BudgetCluster {
     }
 
     /**
-     * Seals the current lease and asks for another.
+     * Asks for the next lease, settling whatever figure is ready to be settled.
      *
-     * <p>Sealing before asking is what makes the reported figure final, and it is why the shard
-     * spends nothing for one round trip. Rate-limited on the shard's own clock rather than
-     * guarded by an in-flight flag: a flag would strand the shard permanently if the reply were
-     * lost, whereas a cooldown retries on the next traffic tick.
+     * <p>The healthy path is a prefetch: the wallet keeps spending on its live lease while
+     * the request is in flight, and installing the grant displaces that lease into the
+     * pending-release slot, whose final figure rides on the <em>next</em> request. Sealing
+     * happens only when there is nothing left to prefetch for — the wallet is empty or the
+     * lease has already expired. Rate-limited on the shard's own clock rather than guarded
+     * by an in-flight flag: a flag would strand the shard permanently if the reply were
+     * lost, whereas a cooldown retries on the next traffic tick — and the authority
+     * retransmits its live grant on a retry rather than minting another.
      */
     private void maybeRenew(int shard, long now) {
         final SpendAuthority wallet = wallets[shard];
@@ -274,12 +283,29 @@ final class BudgetCluster {
         nextRequestAllowedAt[shard] = now + config.requestCooldownNanos;
 
         final long incarnation = wallet.incarnation();
-        final long sealedLeaseId = wallet.leaseId();
-        final long sealedSpent = wallet.sealForRenewal();
+        final long heldId = wallet.leaseId();
+        final long settleId;
+        final long settleSpent;
+        if (wallet.pendingReleaseId() != Lease.NONE) {
+            settleId = wallet.pendingReleaseId();
+            settleSpent = wallet.pendingReleaseSpentMicros();
+        } else if (wallet.isExpired(now) || wallet.isSealed()
+                || wallet.remainingMicros() < minPriceFloorMicros) {
+            // Nothing left worth prefetching for: the lease is dead, or its remainder is
+            // below the cheapest possible price. Sealing here is also what breaks the
+            // otherwise-endless retransmit loop for a drained never-expiring lease.
+            settleId = wallet.leaseId();
+            settleSpent = wallet.sealForRenewal();
+        } else {
+            // Pure prefetch: nothing to settle yet, keep spending until the grant lands.
+            settleId = Lease.NONE;
+            settleSpent = 0L;
+        }
 
         net.send(nodeOf(shard), AUTHORITY_NODE, "lease-req s" + shard + " i" + incarnation, () -> {
             final Lease lease = authority.requestLease(
-                    shard, incarnation, sealedLeaseId, sealedSpent, config.leaseMicros, authorityClock.nanos());
+                    shard, incarnation, heldId, settleId, settleSpent, config.leaseMicros,
+                    authorityClock.nanos());
             if (lease == null) {
                 return;
             }
@@ -288,7 +314,17 @@ final class BudgetCluster {
                 if (current.incarnation() != incarnation) {
                     return;
                 }
-                current.installLease(lease, clocks[shard].nanos());
+                if (current.installLease(lease, clocks[shard].nanos())
+                        && current.pendingReleaseId() != Lease.NONE) {
+                    // Prompt release: send the displaced lease's final figure right away,
+                    // so its remainder returns without waiting for the next renewal. If
+                    // this message is lost, the next renewal names the same record and a
+                    // periodic report carries the same figure — all three are idempotent.
+                    final long releaseId = current.pendingReleaseId();
+                    final long releaseSpent = current.pendingReleaseSpentMicros();
+                    net.send(nodeOf(shard), AUTHORITY_NODE, "release s" + shard + " #" + releaseId,
+                            () -> authority.releaseSealed(shard, incarnation, releaseId, releaseSpent));
+                }
             });
         });
     }
@@ -312,6 +348,17 @@ final class BudgetCluster {
             return;
         }
         final long incarnation = wallet.incarnation();
+
+        // The pending release's figure normally travels on the next lease request, but if
+        // that request never arrives this report is what the sweeper will settle at. A
+        // report for an already-settled lease is simply ignored.
+        final long pendingId = wallet.pendingReleaseId();
+        if (pendingId != Lease.NONE) {
+            final long pendingSpent = wallet.pendingReleaseSpentMicros();
+            net.send(nodeOf(shard), AUTHORITY_NODE, "report s" + shard + " #" + pendingId, () ->
+                    authority.recordReport(shard, incarnation, pendingId, pendingSpent));
+        }
+
         final long leaseId = wallet.leaseId();
         final long spent = wallet.leaseSpentMicros();
         net.send(nodeOf(shard), AUTHORITY_NODE, "report s" + shard + " #" + leaseId, () ->

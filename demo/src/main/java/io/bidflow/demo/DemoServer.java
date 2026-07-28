@@ -334,8 +334,9 @@ public final class DemoServer {
         }
         final long sealedLeaseId = c.wallet.leaseId();
         final long sealedSpent = c.wallet.sealForRenewal();
+        // Seal-then-ask, so the held and sealed lease are the same one.
         final Lease lease = c.authority.requestLease(
-                0, 1L, sealedLeaseId, sealedSpent, Math.max(LEASE_MICROS, c.bidMicros), now);
+                0, 1L, sealedLeaseId, sealedLeaseId, sealedSpent, Math.max(LEASE_MICROS, c.bidMicros), now);
         if (lease != null) {
             c.wallet.installLease(lease, now);
         }

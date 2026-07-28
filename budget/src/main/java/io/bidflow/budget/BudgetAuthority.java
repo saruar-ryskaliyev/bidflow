@@ -119,10 +119,14 @@ public final class BudgetAuthority {
      * Settles a sealed lease if one is named, then issues a fresh lease from whatever budget is
      * left.
      *
-     * <p>A retry that arrives while the previous grant is still live and unacknowledged is
-     * answered by retransmitting that grant rather than minting another, so a slow or lost
-     * reply does not strand additional leases.
+     * <p>A retry that arrives while a grant <em>newer than anything the caller holds</em> is
+     * still live is answered by retransmitting that grant rather than minting another, so a
+     * slow or lost reply does not strand additional leases. Held and settled are separate
+     * parameters because under prefetch they differ: the shard settles its previous lease
+     * while holding — and still spending — the current one, and conflating the two would make
+     * the authority retransmit a grant the shard already installed, starving it of the next.
      *
+     * @param heldLeaseId the newest lease the caller has installed, or {@link Lease#NONE}
      * @param sealedLeaseId the lease the caller has stopped spending on, or {@link Lease#NONE}
      * @param sealedSpentMicros that lease's final spend, meaningful only if it was sealed first
      * @return the new lease, or null if the caller is superseded or the budget is exhausted
@@ -130,6 +134,7 @@ public final class BudgetAuthority {
     public Lease requestLease(
             int shardId,
             long incarnation,
+            long heldLeaseId,
             long sealedLeaseId,
             long sealedSpentMicros,
             long wantedMicros,
@@ -163,7 +168,7 @@ public final class BudgetAuthority {
         // efficiency measurements flagged. Retransmission is safe because the wallet
         // already treats a duplicated or superseded grant as a no-op.
         final Outstanding pending = newestOutstanding(shardId, incarnation);
-        if (pending != null && pending.leaseId > sealedLeaseId && nowNanos < pending.expiresAtNanos) {
+        if (pending != null && pending.leaseId > heldLeaseId && nowNanos < pending.expiresAtNanos) {
             leasesRetransmitted++;
             return new Lease(pending.leaseId, pending.amountMicros, pending.expiresAtNanos);
         }
@@ -180,6 +185,24 @@ public final class BudgetAuthority {
         outstandingMicros += amount;
         leasesIssued++;
         return lease;
+    }
+
+    /**
+     * Settles a finished lease at its final figure without granting anything in return.
+     *
+     * <p>This is the prompt half of the prefetch protocol: the moment a shard displaces a
+     * live lease with a newer grant, it sends the displaced lease's final figure here, so
+     * the unspent remainder returns to the pool without waiting for the next renewal.
+     * Idempotent — a duplicated release, or one racing a renewal that names the same
+     * lease, finds nothing left to settle.
+     */
+    public void releaseSealed(int shardId, long incarnation, long leaseId, long finalSpentMicros) {
+        checkShard(shardId);
+        if (finalSpentMicros < 0) {
+            throw new IllegalArgumentException(
+                    "finalSpentMicros must not be negative, was " + finalSpentMicros);
+        }
+        release(shardId, incarnation, leaseId, finalSpentMicros);
     }
 
     /**
