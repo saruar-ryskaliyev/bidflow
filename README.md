@@ -114,8 +114,8 @@ reclaim. Twelve seeds per row.
 
 | Reclaim margin | Spent | Overspend | Reclaimed |
 | --- | --- | --- | --- |
-| 0 ms | 136.04% | 36.04% | 137.25% |
-| 50 ms | 136.04% | 36.04% | 108.58% |
+| 0 ms | 136.04% | 36.04% | 137.10% |
+| 50 ms | 136.04% | 36.04% | 108.43% |
 | 100 ms | 117.52% | 17.52% | 69.47% |
 | 150 ms | 99.99% | **0.00%** | 0.00% |
 | 300 ms | 99.99% | **0.00%** | 0.00% |
@@ -137,41 +137,51 @@ Twelve seeds per row.
 
 | Configuration | Delivered | Overspend | Reclaimed |
 | --- | --- | --- | --- |
-| No expiry (the previous design) | 53.57% | **0.00%** | 0.00% |
-| Expiry, never reclaim | 49.64% | **0.00%** | 0.00% |
-| Expiry + reclaim, 500 ms margin | 59.91% | 0.095% | 93.63% |
-| Expiry + reclaim, 200 ms margin | 62.09% | 0.207% | 140.65% |
-| Expiry + reclaim, 100 ms margin | 63.49% | 0.247% | 164.82% |
-| Expiry + reclaim, 50 ms margin | 64.30% | 0.247% | 246.53% |
-| Expiry + reclaim, 0 ms margin | 66.79% | 1.123% | 433.23% |
+| No expiry (the previous design) | 71.97% | **0.00%** | 0.00% |
+| Expiry, never reclaim | 56.12% | **0.00%** | 0.00% |
+| Expiry + reclaim, 500 ms margin | 57.61% | 0.095% | 16.92% |
+| Expiry + reclaim, 200 ms margin | 57.78% | 0.207% | 20.04% |
+| Expiry + reclaim, 100 ms margin | 57.82% | 0.247% | 23.57% |
+| Expiry + reclaim, 50 ms margin | 57.82% | 0.247% | 55.50% |
+| Expiry + reclaim, 0 ms margin | 58.70% | 1.123% | 132.13% |
 
 Three findings.
 
-**Expiry on its own is a regression.** 49.64% against 53.57% for never expiring at all. A lease
+**Expiry on its own is a regression.** 56.12% against 71.97% for never expiring at all. A lease
 that lapses unspent is wasted twice — the holder may no longer spend it and the authority still
 does not take it back. Expiry is not a feature, it is an enabler, and it only pays off paired with
 reclaim.
 
-**The pair is a real improvement, and the price is explicit.** Against the 53.57% baseline,
-a 500 ms margin buys six points of delivery for 0.095% overspend; a zero margin buys thirteen
-points for 1.1%. Which of those is correct is a business question about whether unbilled delivery
-costs more than undelivered budget, not an engineering one — and the point of the curve is that
-the question can now be answered with numbers instead of intuition.
+**The renewal tax is now the visible cost of expiry.** With the request stampede fixed (see
+below), the never-expire baseline outdelivers every expiring configuration in this three-second
+window: the crashes that fit in it strand at most a few percent of budget, while expiry pays a
+continuous protocol tax — a sealed round trip per lease — worth about thirteen points of delivery
+at this lease duration. The trade is visible instead of hidden: expiry bounds what any single
+crash can cost at one lease of face value, and the premium for that insurance is the renewal
+tax, which is exactly the next inefficiency to attack. Over a horizon longer than an experiment,
+never-expiring leases lose ground again, because every crash strands its lease forever.
 
-**Diminishing returns are sharp.** Delivery moves 6.9 points across the whole margin range while
-reclaim churn more than quadruples. Most of the recoverable money comes back with a patient
-margin; the aggressive settings buy little and risk an order of magnitude more.
+**Aggressive margins churn far more than they recover.** Reclaim at a zero margin now buys 2.6
+points of delivery over never reclaiming, at 132% of budget in churn and 1.1% overspend — and
+before the stampede fix that churn read 433%, which says most of it was the sweeper recycling
+leases the stampede had stranded, not recovery of real losses.
 
 The comparison against "no expiry" is measured under the identical fault mix rather than quoted
 from an earlier run. An improvement demonstrated against a differently-configured baseline would
 not be an improvement.
 
-### Known inefficiencies, not yet addressed
+### Known inefficiencies, one fixed and measured
 
-Delivery peaks around 67%, so most of the shortfall is still unexplained by reclaim alone. Three
-candidates are visible in the design and none has been fixed: a shard whose reply is slow will ask
-again on its cooldown and accumulate leases it did not need; sealing before renewal costs one
-round trip per lease during which the shard spends nothing; and a shard holding less than the
+**Fixed: the renewal request stampede.** A shard whose reply was slow used to ask again on its
+cooldown, and every retry minted another lease that stranded until the sweeper collected it. The
+authority now answers a retry by retransmitting the still-live previous grant — safe because the
+wallet already treats a duplicated grant as a no-op. Under the identical fault mix, the fix moved
+the no-expiry baseline from 53.57% to 71.97% delivered and cut zero-margin reclaim churn from
+433% of budget to 132% with overspend unchanged: most of that churn had been the sweeper
+recycling stampede strandings.
+
+Two inefficiencies remain: sealing before renewal costs one round trip per lease during which
+the shard spends nothing — now the dominant cost of expiry — and a shard holding less than the
 price of a click cannot spend its remainder.
 
 ## The mechanism
@@ -349,9 +359,9 @@ experiments quantifying what reclaim costs and returns — with spend priced by 
 inside them — and the JMH microbenchmarks that turned the latency and allocation design goals
 into measurements.
 
-1. **Close the rest of the delivery gap** — 67% is still not good enough, and the three suspected
-   causes above are all measurable. Fixing the request stampede and the renewal gap should be
-   worth more than any further tuning of the reclaim margin.
+1. **Close the rest of the delivery gap** — expiry still costs about thirteen points of delivery
+   against the no-expiry baseline, and most of that is the sealed renewal round trip. Closing the
+   renewal gap should be worth more than any further tuning of the reclaim margin.
 2. **Pacing controller** — spend the budget smoothly across a day of varying traffic rather than
    exhausting it by mid-morning, built on the lease mechanism rather than beside it.
 3. **Simulation explorer** — a static site, generated by CI from a real run, replaying a

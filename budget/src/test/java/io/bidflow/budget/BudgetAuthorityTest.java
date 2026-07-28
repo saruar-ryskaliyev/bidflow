@@ -73,14 +73,17 @@ class BudgetAuthorityTest {
         }
 
         @Test
-        @DisplayName("gives every lease a distinct increasing id")
+        @DisplayName("gives each renewal a distinct increasing id")
         void leaseIdsIncrease() {
+            // Ids increase across renewals — a retry without a seal retransmits instead,
+            // which the grant-retransmission tests pin down separately.
             final BudgetAuthority bank = bank(1_000L, 1);
-            final long first = firstLease(bank, 0, 100L, T0).leaseId();
-            bank.requestLease(0, 1L, Lease.NONE, 0L, 100L, T0);
-            final Lease third = bank.requestLease(0, 1L, Lease.NONE, 0L, 100L, T0);
+            final Lease first = firstLease(bank, 0, 100L, T0);
+            final Lease second = bank.requestLease(0, 1L, first.leaseId(), 50L, 100L, T0);
+            final Lease third = bank.requestLease(0, 1L, second.leaseId(), 50L, 100L, T0);
 
-            assertThat(third.leaseId()).isGreaterThan(first);
+            assertThat(second.leaseId()).isGreaterThan(first.leaseId());
+            assertThat(third.leaseId()).isGreaterThan(second.leaseId());
         }
     }
 
@@ -203,6 +206,59 @@ class BudgetAuthorityTest {
             firstLease(bank, 1, 200L, T0 + 5_000L);
 
             assertThat(bank.reclaimExpired(T0 + LEASE_DURATION + MARGIN)).isEqualTo(1);
+            assertThat(bank.outstandingLeaseCount()).isEqualTo(1);
+        }
+    }
+
+    @Nested
+    @DisplayName("grant retransmission")
+    class GrantRetransmission {
+
+        @Test
+        @DisplayName("a retry gets the previous grant back rather than a second lease")
+        void retryGetsTheSameGrant() {
+            final BudgetAuthority bank = bank(1_000L, 1);
+            final Lease first = firstLease(bank, 0, 300L, T0);
+
+            // The reply was slow or lost, so the shard asks again without naming a seal.
+            final Lease retry = bank.requestLease(0, 1L, Lease.NONE, 0L, 300L, T0 + 10);
+
+            assertThat(retry.leaseId()).isEqualTo(first.leaseId());
+            assertThat(retry.amountMicros()).isEqualTo(first.amountMicros());
+            assertThat(bank.leasesIssued()).isEqualTo(1L);
+            assertThat(bank.leasesRetransmitted()).isEqualTo(1L);
+            // Nothing extra was reserved: retries are free instead of stranding face value.
+            assertThat(bank.outstandingLeaseCount()).isEqualTo(1);
+            assertThat(bank.outstandingMicros()).isEqualTo(300L);
+        }
+
+        @Test
+        @DisplayName("an expired pending grant is not retransmitted")
+        void expiredGrantIsNotRetransmitted() {
+            final BudgetAuthority bank = bank(1_000L, 1);
+            final Lease first = firstLease(bank, 0, 300L, T0);
+
+            // Past expiry the old grant is useless to the holder; it waits for the
+            // sweeper while a fresh lease is minted from the remaining headroom.
+            final Lease retry = bank.requestLease(
+                    0, 1L, Lease.NONE, 0L, 300L, first.expiresAtNanos());
+
+            assertThat(retry.leaseId()).isGreaterThan(first.leaseId());
+            assertThat(bank.leasesRetransmitted()).isZero();
+            assertThat(bank.outstandingLeaseCount()).isEqualTo(2);
+        }
+
+        @Test
+        @DisplayName("a renewal that seals the retransmitted grant proceeds normally")
+        void renewalAfterRetransmissionMintsFresh() {
+            final BudgetAuthority bank = bank(1_000L, 1);
+            final Lease first = firstLease(bank, 0, 300L, T0);
+            bank.requestLease(0, 1L, Lease.NONE, 0L, 300L, T0 + 10);
+
+            final Lease next = bank.requestLease(0, 1L, first.leaseId(), 120L, 300L, T0 + 20);
+
+            assertThat(next.leaseId()).isGreaterThan(first.leaseId());
+            assertThat(bank.settledMicros()).isEqualTo(120L);
             assertThat(bank.outstandingLeaseCount()).isEqualTo(1);
         }
     }

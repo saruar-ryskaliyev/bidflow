@@ -76,6 +76,7 @@ public final class BudgetAuthority {
     private long outstandingMicros;
 
     private long leasesIssued;
+    private long leasesRetransmitted;
     private long leasesExhausted;
     private long leasesSuperseded;
     private long leasesReleased;
@@ -118,6 +119,10 @@ public final class BudgetAuthority {
      * Settles a sealed lease if one is named, then issues a fresh lease from whatever budget is
      * left.
      *
+     * <p>A retry that arrives while the previous grant is still live and unacknowledged is
+     * answered by retransmitting that grant rather than minting another, so a slow or lost
+     * reply does not strand additional leases.
+     *
      * @param sealedLeaseId the lease the caller has stopped spending on, or {@link Lease#NONE}
      * @param sealedSpentMicros that lease's final spend, meaningful only if it was sealed first
      * @return the new lease, or null if the caller is superseded or the budget is exhausted
@@ -150,6 +155,17 @@ public final class BudgetAuthority {
         }
         if (sealedLeaseId != Lease.NONE) {
             release(shardId, incarnation, sealedLeaseId, sealedSpentMicros);
+        }
+
+        // A shard that asks again because the previous grant's reply is slow or lost gets
+        // that grant retransmitted, not a second lease minted. Every extra mint strands
+        // face value until the sweeper collects it, which is the request stampede the
+        // efficiency measurements flagged. Retransmission is safe because the wallet
+        // already treats a duplicated or superseded grant as a no-op.
+        final Outstanding pending = newestOutstanding(shardId, incarnation);
+        if (pending != null && pending.leaseId > sealedLeaseId && nowNanos < pending.expiresAtNanos) {
+            leasesRetransmitted++;
+            return new Lease(pending.leaseId, pending.amountMicros, pending.expiresAtNanos);
         }
 
         final long headroom = budgetMicros - settledMicros - outstandingMicros;
@@ -247,6 +263,20 @@ public final class BudgetAuthority {
         return index < 0 ? null : outstanding.get(index);
     }
 
+    /** The live lease this incarnation was granted most recently, or null. */
+    private Outstanding newestOutstanding(int shardId, long incarnation) {
+        Outstanding newest = null;
+        for (int i = 0; i < outstanding.size(); i++) {
+            final Outstanding lease = outstanding.get(i);
+            if (lease.shardId == shardId
+                    && lease.incarnation == incarnation
+                    && (newest == null || lease.leaseId > newest.leaseId)) {
+                newest = lease;
+            }
+        }
+        return newest;
+    }
+
     private int indexOf(int shardId, long incarnation, long leaseId) {
         for (int i = 0; i < outstanding.size(); i++) {
             final Outstanding lease = outstanding.get(i);
@@ -304,6 +334,11 @@ public final class BudgetAuthority {
 
     public long leasesIssued() {
         return leasesIssued;
+    }
+
+    /** Requests answered by re-sending the still-live previous grant instead of minting. */
+    public long leasesRetransmitted() {
+        return leasesRetransmitted;
     }
 
     /** Requests that found the budget fully committed. */
