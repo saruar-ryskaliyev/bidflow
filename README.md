@@ -1,6 +1,6 @@
 # bidflow
 
-[![build](https://github.com/saruar-ryskaliyev/bidflow/actions/workflows/build.yml/badge.svg)](https://github.com/saruar-ryskaliyev/bidflow/actions/workflows/build.yml)
+[build](https://github.com/saruar-ryskaliyev/bidflow/actions/workflows/build.yml)
 
 A real-time ad auction service in Java, built for the latency budget a sponsored-results
 page actually has: the auction must resolve in microseconds, must never overcharge an
@@ -18,20 +18,22 @@ around. See [the hard problem](#the-hard-problem-distributed-budget-enforcement)
 
 ## Status
 
-| Component | State |
-| --- | --- |
-| `auction-core` — GSP ranking and pricing | Implemented, 30 tests green |
-| `sim` — deterministic simulation harness | Implemented, 31 tests green |
-| `budget` — distributed budget enforcement | Leases and reclaim implemented, 45 tests green |
-| `demo` — browser demo of auction + budget | Implemented, 6 tests green, `./gradlew :demo:run` |
-| Pacing controller | Next |
-| Idempotent spend ledger | Not started |
-| gRPC serving layer | Not started |
-| `bench` — JMH microbenchmarks | Implemented; load harness not started |
+
+| Component                                          | State                                                              |
+| -------------------------------------------------- | ------------------------------------------------------------------ |
+| `auction-core` — GSP ranking and pricing           | Implemented, 30 tests green                                        |
+| `sim` — deterministic simulation harness           | Implemented, 31 tests green                                        |
+| `budget` — leases, reclaim, and pacing             | Implemented, 67 tests green                                        |
+| `ledger` — checksummed WAL + idempotent charges    | Implemented, 8 tests green                                         |
+| `demo` — browser demo of auction + budget          | Implemented, 6 tests green, `./gradlew :demo:run`                  |
+| `serving` — budget-aware gRPC + shedding           | Implemented, 15 tests green, `./gradlew :serving:run`              |
+| `load` — open-loop HDR harness + G1/ZGC scripts    | Implemented, 3 tests green                                         |
+| `bench` — JMH microbenchmarks                      | Implemented                                                        |
+
 
 Performance is no longer a claim: the auction and the serving-path budget check are
-measured under JMH with allocation profiling in
-[Measured performance](#measured-performance).
+measured under JMH in [Measured performance](#measured-performance), and sustained
+serving latency under open-loop load is in [Load and GC](#load-and-gc).
 
 ## The hard problem: distributed budget enforcement
 
@@ -65,7 +67,9 @@ The two properties to be demonstrated, under partition, crash, and skew:
 
 - **Safety** — total spend never exceeds the budget by more than a stated, argued bound.
 - **Efficiency** — when demand exceeds budget, delivery reaches within a stated fraction of
-  it rather than stranding the remainder.
+it rather than stranding the remainder.
+
+
 
 ## Deterministic simulation
 
@@ -111,13 +115,15 @@ fault-injection seeds. It has never been violated.
 Every shard's clock runs 150 ms behind the authority — healthy network, frequent reports, no
 faults. Twelve seeds per row.
 
-| Reclaim margin | Spent | Overspend | Reclaimed |
-| --- | --- | --- | --- |
-| 0 ms | 135.94% | 35.94% | 137.36% |
-| 50 ms | 135.94% | 35.94% | 108.65% |
-| 100 ms | 118.64% | 18.64% | 69.97% |
-| 150 ms | 100.19% | 0.19% | 3.55% |
-| 300 ms | 100.00% | 0.00% | 2.74% |
+
+| Reclaim margin | Spent   | Overspend | Reclaimed |
+| -------------- | ------- | --------- | --------- |
+| 0 ms           | 135.94% | 35.94%    | 137.36%   |
+| 50 ms          | 135.94% | 35.94%    | 108.65%   |
+| 100 ms         | 118.64% | 18.64%    | 69.97%    |
+| 150 ms         | 100.19% | 0.19%     | 3.55%     |
+| 300 ms         | 100.00% | 0.00%     | 2.74%     |
+
 
 An impatient authority takes leases back from shards that are still spending on them, and the
 overspend is severe — 36% of budget, and a reclaim total larger than the budget itself because
@@ -139,15 +145,17 @@ Randomised deployments with crashes, partitions, and ±50 ms skew, drawn from th
 where reclaim earns its keep, because crashed and partitioned shards never release anything.
 Twelve seeds per row.
 
-| Configuration | Delivered | Overspend | Reclaimed |
-| --- | --- | --- | --- |
-| No expiry (the previous design) | 73.92% | **0.00%** | 0.00% |
-| Expiry, never reclaim | 57.97% | **0.00%** | 0.00% |
-| Expiry + reclaim, 500 ms margin | 61.17% | 0.000% | 25.74% |
-| Expiry + reclaim, 200 ms margin | 62.63% | 0.056% | 31.04% |
-| Expiry + reclaim, 100 ms margin | 63.18% | 0.366% | 40.18% |
-| Expiry + reclaim, 50 ms margin | 63.24% | 0.423% | 83.64% |
-| Expiry + reclaim, 0 ms margin | 64.42% | 1.606% | 146.09% |
+
+| Configuration                   | Delivered | Overspend | Reclaimed |
+| ------------------------------- | --------- | --------- | --------- |
+| No expiry (the previous design) | 73.92%    | **0.00%** | 0.00%     |
+| Expiry, never reclaim           | 57.97%    | **0.00%** | 0.00%     |
+| Expiry + reclaim, 500 ms margin | 61.17%    | 0.000%    | 25.74%    |
+| Expiry + reclaim, 200 ms margin | 62.63%    | 0.056%    | 31.04%    |
+| Expiry + reclaim, 100 ms margin | 63.18%    | 0.366%    | 40.18%    |
+| Expiry + reclaim, 50 ms margin  | 63.24%    | 0.423%    | 83.64%    |
+| Expiry + reclaim, 0 ms margin   | 64.42%    | 1.606%    | 146.09%   |
+
 
 Three findings.
 
@@ -230,12 +238,14 @@ slot against the same rival pay different amounts, and the more relevant one pay
 
 Three slots, reserve 5,000 micros, all candidates at quality 1.0:
 
-| Campaign | Bid (micros) | Quality | Ad rank | Slot | Pays |
-| --- | --- | --- | --- | --- | --- |
-| A | 100,000 | 1.00 | 1,000,000,000 | 1 | 80,000 |
-| B | 80,000 | 1.00 | 800,000,000 | 2 | 60,000 |
-| C | 60,000 | 1.00 | 600,000,000 | 3 | 40,000 |
-| D | 40,000 | 1.00 | 400,000,000 | — | — |
+
+| Campaign | Bid (micros) | Quality | Ad rank       | Slot | Pays   |
+| -------- | ------------ | ------- | ------------- | ---- | ------ |
+| A        | 100,000      | 1.00    | 1,000,000,000 | 1    | 80,000 |
+| B        | 80,000       | 1.00    | 800,000,000   | 2    | 60,000 |
+| C        | 60,000       | 1.00    | 600,000,000   | 3    | 40,000 |
+| D        | 40,000       | 1.00    | 400,000,000   | —    | —      |
+
 
 Nobody pays their own bid; each pays just enough to hold off the ad beneath it, and D sets
 the price of the last slot without winning anything.
@@ -294,11 +304,13 @@ wrong trade at this latency target.
 JMH 1.37 on an Apple M4 (macOS 15.6), OpenJDK 25, average time over two forks with the GC
 profiler attached. `./gradlew :bench:run --args="-prof gc"` reproduces the run.
 
-| Operation | Cost | Allocation |
-| --- | --- | --- |
-| Full auction — 64 candidates, 3 slots | 274.7 ± 12.2 ns | ≈ 0 B/op |
-| Full auction — 8 candidates, 3 slots | 40.2 ± 1.6 ns | ≈ 0 B/op |
-| `tryReserve` — the per-request budget check | 1.91 ± 0.15 ns | ≈ 0 B/op |
+
+| Operation                                   | Cost            | Allocation |
+| ------------------------------------------- | --------------- | ---------- |
+| Full auction — 64 candidates, 3 slots       | 274.7 ± 12.2 ns | ≈ 0 B/op   |
+| Full auction — 8 candidates, 3 slots        | 40.2 ± 1.6 ns   | ≈ 0 B/op   |
+| `tryReserve` — the per-request budget check | 1.91 ± 0.15 ns  | ≈ 0 B/op   |
+
 
 The auction fits its microsecond budget more than three times over at the largest
 candidate set benchmarked, and the budget check is cheap enough that enforcement adds
@@ -308,8 +320,142 @@ JMH's own infrastructure — and no collection ran during measurement, so a warm
 thread gives the collector no work to do.
 
 The honest caveats: these are single-threaded microbenchmark averages on one quiet
-machine, not a loaded service's p99. The load harness that would measure tail latency
-under sustained traffic, free of coordinated omission, is still on the roadmap.
+machine, not a loaded service's p99. Sustained tail latency under open-loop load is
+measured separately in [Load and GC](#load-and-gc).
+
+## End-to-end data flow
+
+The portfolio-complete path is:
+
+```
+paced BudgetAuthority ──async lease──▶ ServingShard wallet
+                                            │
+Client ──RunAuction──▶ GSP (local omit if bid > wallet)
+                                            │
+                                   opaque auction token
+                                            │
+Client ──RecordClick(token, slot, key)──▶ receipt store
+                                            │
+                                   SpendLedger.charge (WAL + force)
+                                            │
+                                   wallet reserve / refuse / replay
+```
+
+Global remaining budget lives in a single-owner `BudgetAuthority`. A deterministic
+`PacingController` caps lease grants against a target spend curve so a day of budget is
+not exhausted by mid-morning. Shards hold local `SpendAuthority` wallets from those
+leases and never consult the authority on the auction path. When a click arrives, the
+server — not the client — supplies campaign and cleared GSP price from a bounded receipt
+store; the `SpendLedger` persists the outcome under an idempotency key before
+acknowledging, so a retried click cannot double-bill.
+
+## The serving layer
+
+The auction is only useful if it answers before the page has moved on. The `serving`
+module puts the engine behind gRPC with the controls that matter at that deadline:
+
+**Shedding happens at admission, not in a queue.** An interceptor holds an inflight
+semaphore sized to the worker count plus a configured queue depth. The permit is held
+until the call closes or cancels — not merely until the request stream completes — so
+`workers + queueDepth` is the true maximum outstanding work. Excess calls are closed
+with `RESOURCE_EXHAUSTED` on the transport thread.
+
+**Workers are fixed platform threads, not virtual threads.** Each worker owns a
+`ThreadLocal` (or shard-owned) bundle of auction buffers, so a warmed thread allocates
+nothing for the auction itself. The gRPC transport keeps its own executor for call
+lifecycle; the handler hops onto the worker pool so a parked auction cannot stall
+admission. Client deadlines propagate through `Context`.
+
+**Budget-aware mode wires leases and clicks.** `AuctionServer … budget [ledgerDir]`
+starts paced campaign authorities, per-shard wallets, a receipt store, and a durable
+ledger. `RunAuction` returns an opaque auction token; `RecordClick` charges the
+server-owned GSP price exactly once under the client's idempotency key. Lease
+prefetch/report/release stays asynchronous — a blocked coordinator does not stall
+auctions that still hold a live lease.
+
+Pure-auction mode (`./gradlew :serving:run`) remains available for transport and
+shedding experiments without a ledger.
+
+## Pacing
+
+`LeaseGrantPolicy` / `PacingController` sit in front of lease issuance. The default
+`UnpacedGrantPolicy` preserves the original grant behaviour for simulation baselines.
+The proportional controller compares observed spend (`settled + outstanding reported`)
+to a linear target curve in fixed-point basis points and returns a smoothed grant cap
+in `[0, requestedMicros]`. Front-loaded and varying demand profiles in `BudgetCluster`
+plus unit/property tests keep delivery near the curve without violating the
+overspend-is-bounded-by-reclaim theorem.
+
+## Spend ledger
+
+The `:ledger` module is a single-writer, database-free durability layer:
+
+- length-prefixed, versioned WAL records with CRC32C;
+- torn final records truncated on recovery; corruption before the tail fails closed;
+- checksummed snapshots written to a temp file, forced, then atomically renamed;
+- `charge(idempotencyKey, …)` returns `ACCEPTED`, `REPLAYED`, `REFUSED`, or `CONFLICT`.
+
+If persistence fails after a wallet reservation, the RPC fails and authority is stranded
+rather than risking a double bill; recovery reconciles per-lease committed totals before
+a restarted shard requests fresh leases.
+
+## Load and GC
+
+The `:load` module is a separate open-loop client. Arrivals are scheduled at a fixed
+intended RPS; completion latency is recorded from the *intended* start, so stalls appear
+as long samples instead of being omitted (coordinated-omission-free). Results include
+HdrHistogram percentiles, throughput, deadline, and saturation counts as JSON under
+`load/build/results`.
+
+**Measured smoke (Apple M4, macOS 15.6, OpenJDK 25, pure-auction server, 64 candidates,
+1500 RPS, 2 s warmup + 8 s measure, default 50 ms deadline):**
+
+
+| Metric | Value      |
+| ------ | ---------- |
+| count  | 12,000     |
+| mean   | 0.707 ms   |
+| p50    | 0.293 ms   |
+| p90    | 0.444 ms   |
+| p99    | 16.8 ms    |
+| p99.9  | 47.1 ms    |
+| max    | 55.7 ms    |
+| shed   | 0 / 0      |
+
+
+Reproduce a short run:
+
+```bash
+./gradlew :serving:installDist :load:installDist
+serving/build/install/serving/bin/serving 50051 &
+load/build/install/load/bin/load \
+  --host localhost --port 50051 --rps 1500 --warmup 2 --duration 8 \
+  --candidates 64 --out load/build/results/portfolio-smoke.json
+```
+
+**60-second G1 vs ZGC** (same machine, 2000 intended RPS, 5 s warmup + 60 s measure,
+64 candidates, 200 ms client deadline, identical client flags):
+
+
+| Collector | Throughput | p50     | p90    | p99     | p99.9   | Deadline | Saturated |
+| --------- | ---------- | ------- | ------ | ------- | ------- | -------- | --------- |
+| G1        | 1869.8 rps | 0.323 ms | 13.9 ms | 1400 ms | 2055 ms | 6533     | 1281      |
+| ZGC       | 1984.7 rps | 0.299 ms | 2.02 ms | 77.5 ms | 192 ms  | 0        | 878       |
+
+
+This run does **not** assert a winner. On this laptop under this open-loop offer rate,
+ZGC kept intended-start tails and deadline misses far lower; G1 spent more of the
+window recovering. Re-run on your hardware:
+
+```bash
+./load/scripts/run-gc-compare.sh
+# writes load/build/results/{g1,zgc}.json and matching *.gc.log
+```
+
+Caveats: one quiet laptop; CI only runs the load module's unit/smoke tests; the
+workspace path may contain spaces, so the compare script parks GC logs under
+`/tmp/bidflow-gc-compare` before copying them into `load/build/results`. Treat the
+60-second script as the acceptance measurement.
 
 ## Testing
 
@@ -343,15 +489,15 @@ effective, because a green suite whose tests cannot fail is worse than no suite 
 trusted.
 
 - Disabling the one-slot-per-campaign rule was caught by three tests, with the property
-  shrinking to the minimal counterexample `campaign 1 repeated at position 1`.
+shrinking to the minimal counterexample `campaign 1 repeated at position 1`.
 - Adding a single `System.nanoTime()` call that perturbed simulated network latency by 0–2
-  nanoseconds was caught by both determinism tests.
+nanoseconds was caught by both determinism tests.
 - Removing the insertion-order tiebreak among simultaneous events was caught only by the
-  FIFO-ordering test, **not** by the determinism tests. That result corrected a wrong belief
-  rather than confirming a right one: a binary heap resolves equal keys reproducibly, so the
-  tiebreak is not what buys determinism. It is what stops event order from being arbitrary
-  and from shifting when unrelated events are added elsewhere in a scenario. The comment in
-  `Simulation` now says so.
+FIFO-ordering test, **not** by the determinism tests. That result corrected a wrong belief
+rather than confirming a right one: a binary heap resolves equal keys reproducibly, so the
+tiebreak is not what buys determinism. It is what stops event order from being arbitrary
+and from shifting when unrelated events are added elsewhere in a scenario. The comment in
+`Simulation` now says so.
 
 Compilation runs under `-Xlint:all -Werror`.
 
@@ -363,6 +509,11 @@ Requires JDK 25. The Gradle wrapper handles the rest.
 ./gradlew build          # compile and test everything
 ./gradlew :auction-core:test
 ./gradlew :demo:run      # interactive demo at http://localhost:8080
+./gradlew :serving:run   # pure-auction gRPC on :50051
+# budget-aware (leases + RecordClick + ledger):
+./gradlew :serving:installDist
+serving/build/install/serving/bin/serving 50051 budget build/ledger
+./gradlew :load:run --args="--host localhost --port 50051 --rps 1000 --warmup 1 --duration 5 --out load/build/results/out.json"
 ```
 
 The demo serves a page where two users with different quality scores search the same
@@ -371,25 +522,22 @@ out as budgets exhaust. It runs in one process on one clock, so the skew and par
 behaviour quantified above is deliberately absent — that part lives in the simulation
 tests, where it can be reproduced by seed.
 
-## Roadmap
+## Portfolio complete
 
-Done: the auction, the simulator, lease-based budget enforcement, unilateral reclaim, the two
-experiments quantifying what reclaim costs and returns — with spend priced by the real auction
-inside them — and the JMH microbenchmarks that turned the latency and allocation design goals
-into measurements.
+Done for the selected finish line: GSP auction, deterministic simulator, lease-based
+budget enforcement with unilateral reclaim and paced grants, checksummed idempotent
+spend ledger, budget-aware gRPC serving (no central round trip on the auction path),
+JMH microbenchmarks, and an open-loop load/GC harness.
 
-1. **Price revocability over longer horizons** — in a three-second window, never-expiring leases
-   out-deliver expiry plus reclaim by nine points because a partitioned shard keeps serving from
-   its wallet, while their loss per crash is permanent and accumulates without bound. A run long
-   enough to show the crossover would turn the last qualitative claim in the results into a
-   measured one.
-2. **Pacing controller** — spend the budget smoothly across a day of varying traffic rather than
-   exhausting it by mid-morning, built on the lease mechanism rather than beside it.
-3. **Simulation explorer** — a static site, generated by CI from a real run, replaying a
+## Further research
+
+These remain useful but are **not** blockers to project completion:
+
+1. **Price revocability over longer horizons** — in a three-second window, never-expiring
+   leases out-deliver expiry plus reclaim by nine points because a partitioned shard keeps
+   serving from its wallet, while their loss per crash is permanent and accumulates without
+   bound. A run long enough to show the crossover would turn the last qualitative claim in
+   the results into a measured one.
+2. **Simulation explorer** — a static site, generated by CI from a real run, replaying a
    simulated day and letting the trade-off curve be explored rather than read.
-4. **Spend ledger** — write-ahead log with periodic snapshots and idempotency keys, so a retried
-   click is charged exactly once.
-5. **gRPC serving** — deadline propagation and load shedding, because a late ad response is worth
-   nothing and shedding beats queueing.
-6. **Load harness** — HDR histogram percentiles recorded free of coordinated omission, plus a
-   ZGC-versus-G1 comparison under sustained load.
+
